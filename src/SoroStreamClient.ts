@@ -11,12 +11,16 @@ import {
 import type {
   CancelStreamParams,
   CreateStreamParams,
+  CreateStreamsParams,
   Network,
   Stream,
   TopUpParams,
   WalletAdapter,
   WithdrawParams,
+  WriteOptions,
+  CircuitBreakerOptions as CircuitBreakerOptionsType,
 } from "./types.js";
+import { CircuitBreaker } from "./circuitBreaker.js";
 
 const RPC_URLS: Record<Network, string> = {
   mainnet: "https://soroban.stellar.org",
@@ -40,6 +44,8 @@ export interface SoroStreamClientOptions {
   walletAdapter: WalletAdapter;
   /** Optional custom RPC URL (overrides default). */
   rpcUrl?: string;
+  /** Optional circuit-breaker configuration for RPC calls. */
+  circuitBreaker?: CircuitBreakerOptionsType;
 }
 
 /** Maps a raw Soroban contract value to a Stream object. */
@@ -61,6 +67,11 @@ function scValToStream(val: xdr.ScVal): Stream {
   };
 }
 
+export type SimulateOnlyResult = {
+  simulated: true;
+  result: rpc.Api.SimulateTransactionResponse;
+};
+
 /**
  * Main client for interacting with the SoroStream contract.
  *
@@ -75,6 +86,7 @@ export class SoroStreamClient {
   private readonly contract: Contract;
   private readonly network: Network;
   private readonly walletAdapter: WalletAdapter;
+  private readonly breaker: CircuitBreaker | null;
 
   constructor(options: SoroStreamClientOptions) {
     this.network = options.network;
@@ -83,39 +95,57 @@ export class SoroStreamClient {
     this.server = new rpc.Server(options.rpcUrl ?? RPC_URLS[options.network], {
       allowHttp: false,
     });
+    this.breaker = options.circuitBreaker
+      ? new CircuitBreaker(options.circuitBreaker)
+      : null;
   }
 
-  private async buildAndSubmit(operation: xdr.Operation): Promise<string> {
-    const publicKey = await this.walletAdapter.getPublicKey();
-    const account = await this.server.getAccount(publicKey);
+  private async withBreaker<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.breaker) {
+      return this.breaker.call(fn);
+    }
+    return fn();
+  }
 
-    const tx = new TransactionBuilder(account, {
+  private async buildAndSubmit(operations: xdr.Operation[]): Promise<string> {
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
+
+    let builder = new TransactionBuilder(account, {
       fee: BASE_FEE,
       networkPassphrase: NETWORK_PASSPHRASES[this.network],
-    })
-      .addOperation(operation)
-      .setTimeout(30)
-      .build();
+    });
+    for (const op of operations) {
+      builder = builder.addOperation(op);
+    }
+    const tx = builder.setTimeout(30).build();
 
-    const preparedTx = await this.server.prepareTransaction(tx);
+    const preparedTx = await this.withBreaker(() =>
+      this.server.prepareTransaction(tx)
+    );
     const signedXdr = await this.walletAdapter.signTransaction(
       preparedTx.toXDR(),
       this.network
     );
 
-    const result = await this.server.sendTransaction(
-      TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+    const result = await this.withBreaker(() =>
+      this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+      )
     );
 
     if (result.status === "ERROR") {
       throw new Error(`Transaction failed: ${JSON.stringify(result.errorResult)}`);
     }
 
-    // Poll for completion
-    let response = await this.server.getTransaction(result.hash);
+    let response = await this.withBreaker(() =>
+      this.server.getTransaction(result.hash)
+    );
     while (response.status === "NOT_FOUND") {
       await new Promise((r) => setTimeout(r, 1000));
-      response = await this.server.getTransaction(result.hash);
+      response = await this.withBreaker(() =>
+        this.server.getTransaction(result.hash)
+      );
     }
 
     if (response.status === "FAILED") {
@@ -125,14 +155,33 @@ export class SoroStreamClient {
     return result.hash;
   }
 
+  private async simulateOp(
+    operation: xdr.Operation
+  ): Promise<rpc.Api.SimulateTransactionResponse> {
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASES[this.network],
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build();
+    return this.withBreaker(() => this.server.simulateTransaction(tx));
+  }
+
   /**
    * Creates a new payment stream.
    * @param params - Stream creation parameters.
-   * @returns The new stream ID and transaction hash.
+   * @param options - Optional write options (e.g. simulateOnly).
+   * @returns The new stream ID and transaction hash, or simulation result.
    */
   async createStream(
-    params: CreateStreamParams
-  ): Promise<{ streamId: string; txHash: string }> {
+    params: CreateStreamParams,
+    options?: WriteOptions
+  ): Promise<
+    { streamId: string; txHash: string } | SimulateOnlyResult
+  > {
     if (params.amount <= 0n) throw new Error("Amount must be > 0");
     if (params.durationSeconds <= 0) throw new Error("Duration must be > 0");
 
@@ -148,9 +197,13 @@ export class SoroStreamClient {
       nativeToScVal(params.autoRenew, { type: "bool" })
     );
 
-    const txHash = await this.buildAndSubmit(operation);
+    if (options?.simulateOnly) {
+      const result = await this.simulateOp(operation);
+      return { simulated: true, result };
+    }
 
-    // Fetch latest stream for sender to get ID
+    const txHash = await this.buildAndSubmit([operation]);
+
     const streams = await this.getStreamsBySender(sender);
     const latest = streams[streams.length - 1];
     if (!latest) throw new Error("Stream not found after creation");
@@ -159,11 +212,62 @@ export class SoroStreamClient {
   }
 
   /**
+   * Creates multiple payment streams in a single transaction.
+   * @param paramsArray - Array of stream creation parameters.
+   * @param options - Optional write options (e.g. simulateOnly).
+   * @returns Array of stream IDs and the transaction hash, or simulation result.
+   */
+  async createStreams(
+    paramsArray: CreateStreamParams[],
+    options?: WriteOptions
+  ): Promise<
+    { streamIds: string[]; txHash: string } | SimulateOnlyResult
+  > {
+    if (paramsArray.length === 0) throw new Error("At least one stream is required");
+    for (const params of paramsArray) {
+      if (params.amount <= 0n) throw new Error("Amount must be > 0");
+      if (params.durationSeconds <= 0) throw new Error("Duration must be > 0");
+    }
+
+    const sender = await this.walletAdapter.getPublicKey();
+
+    const operations = paramsArray.map((params) =>
+      this.contract.call(
+        "create_stream",
+        nativeToScVal(sender, { type: "address" }),
+        nativeToScVal(params.recipient, { type: "address" }),
+        nativeToScVal(params.token, { type: "address" }),
+        nativeToScVal(params.amount, { type: "i128" }),
+        nativeToScVal(params.durationSeconds, { type: "u64" }),
+        nativeToScVal(params.autoRenew, { type: "bool" })
+      )
+    );
+
+    if (options?.simulateOnly) {
+      const result = await this.simulateOp(operations[0]);
+      return { simulated: true, result };
+    }
+
+    const before = await this.getStreamsBySender(sender);
+    const txHash = await this.buildAndSubmit(operations);
+    const after = await this.getStreamsBySender(sender);
+    const streamIds = after.slice(before.length).map((s) => s.id);
+
+    return { streamIds, txHash };
+  }
+
+  /**
    * Withdraws all currently claimable tokens from a stream.
    * @param params - Withdraw parameters.
-   * @returns The transaction hash and withdrawn amount.
+   * @param options - Optional write options (e.g. simulateOnly).
+   * @returns The transaction hash and withdrawn amount, or simulation result.
    */
-  async withdraw(params: WithdrawParams): Promise<{ txHash: string; amount: string }> {
+  async withdraw(
+    params: WithdrawParams,
+    options?: WriteOptions
+  ): Promise<
+    { txHash: string; amount: string } | SimulateOnlyResult
+  > {
     const recipient = await this.walletAdapter.getPublicKey();
     const claimable = await this.getClaimable(params.streamId);
 
@@ -173,16 +277,27 @@ export class SoroStreamClient {
       nativeToScVal(recipient, { type: "address" })
     );
 
-    const txHash = await this.buildAndSubmit(operation);
+    if (options?.simulateOnly) {
+      const result = await this.simulateOp(operation);
+      return { simulated: true, result };
+    }
+
+    const txHash = await this.buildAndSubmit([operation]);
     return { txHash, amount: claimable.toString() };
   }
 
   /**
    * Cancels an active stream. Refunds unstreamed tokens to sender.
    * @param params - Cancel parameters.
-   * @returns The transaction hash.
+   * @param options - Optional write options (e.g. simulateOnly).
+   * @returns The transaction hash, or simulation result.
    */
-  async cancelStream(params: CancelStreamParams): Promise<{ txHash: string }> {
+  async cancelStream(
+    params: CancelStreamParams,
+    options?: WriteOptions
+  ): Promise<
+    { txHash: string } | SimulateOnlyResult
+  > {
     const sender = await this.walletAdapter.getPublicKey();
 
     const operation = this.contract.call(
@@ -191,16 +306,27 @@ export class SoroStreamClient {
       nativeToScVal(sender, { type: "address" })
     );
 
-    const txHash = await this.buildAndSubmit(operation);
+    if (options?.simulateOnly) {
+      const result = await this.simulateOp(operation);
+      return { simulated: true, result };
+    }
+
+    const txHash = await this.buildAndSubmit([operation]);
     return { txHash };
   }
 
   /**
    * Tops up an existing stream with additional tokens, extending its duration.
    * @param params - Top-up parameters.
-   * @returns The transaction hash and new end time.
+   * @param options - Optional write options (e.g. simulateOnly).
+   * @returns The transaction hash and new end time, or simulation result.
    */
-  async topUp(params: TopUpParams): Promise<{ txHash: string; newEndTime: Date }> {
+  async topUp(
+    params: TopUpParams,
+    options?: WriteOptions
+  ): Promise<
+    { txHash: string; newEndTime: Date } | SimulateOnlyResult
+  > {
     if (params.amount <= 0n) throw new Error("Amount must be > 0");
     const sender = await this.walletAdapter.getPublicKey();
 
@@ -211,7 +337,12 @@ export class SoroStreamClient {
       nativeToScVal(params.amount, { type: "i128" })
     );
 
-    const txHash = await this.buildAndSubmit(operation);
+    if (options?.simulateOnly) {
+      const result = await this.simulateOp(operation);
+      return { simulated: true, result };
+    }
+
+    const txHash = await this.buildAndSubmit([operation]);
     const stream = await this.getStream(params.streamId);
     return { txHash, newEndTime: new Date(stream.endTime * 1000) };
   }
@@ -221,19 +352,23 @@ export class SoroStreamClient {
    * @param streamId - The stream ID to look up.
    */
   async getStream(streamId: string): Promise<Stream> {
-    const result = await this.server.simulateTransaction(
-      new TransactionBuilder(
-        await this.server.getAccount(await this.walletAdapter.getPublicKey()),
-        { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
-      )
-        .addOperation(
-          this.contract.call(
-            "get_stream",
-            nativeToScVal(BigInt(streamId), { type: "u64" })
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
+    const result = await this.withBreaker(() =>
+      this.server.simulateTransaction(
+        new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASES[this.network],
+        })
+          .addOperation(
+            this.contract.call(
+              "get_stream",
+              nativeToScVal(BigInt(streamId), { type: "u64" })
+            )
           )
-        )
-        .setTimeout(30)
-        .build()
+          .setTimeout(30)
+          .build()
+      )
     );
 
     if (rpc.Api.isSimulationError(result)) {
@@ -250,19 +385,23 @@ export class SoroStreamClient {
    * @param streamId - The stream ID to check.
    */
   async getClaimable(streamId: string): Promise<bigint> {
-    const result = await this.server.simulateTransaction(
-      new TransactionBuilder(
-        await this.server.getAccount(await this.walletAdapter.getPublicKey()),
-        { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
-      )
-        .addOperation(
-          this.contract.call(
-            "get_claimable",
-            nativeToScVal(BigInt(streamId), { type: "u64" })
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
+    const result = await this.withBreaker(() =>
+      this.server.simulateTransaction(
+        new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASES[this.network],
+        })
+          .addOperation(
+            this.contract.call(
+              "get_claimable",
+              nativeToScVal(BigInt(streamId), { type: "u64" })
+            )
           )
-        )
-        .setTimeout(30)
-        .build()
+          .setTimeout(30)
+          .build()
+      )
     );
 
     if (rpc.Api.isSimulationError(result)) return 0n;
@@ -276,20 +415,24 @@ export class SoroStreamClient {
    * Returns all streams created by a sender address.
    * @param sender - The sender address to query.
    */
-  async getStreamsBySender(sender: string): Promise<Stream[]> {
-    const result = await this.server.simulateTransaction(
-      new TransactionBuilder(
-        await this.server.getAccount(await this.walletAdapter.getPublicKey()),
-        { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
-      )
-        .addOperation(
-          this.contract.call(
-            "get_streams_by_sender",
-            nativeToScVal(sender, { type: "address" })
+    async getStreamsBySender(sender: string): Promise<Stream[]> {
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
+    const result = await this.withBreaker(() =>
+      this.server.simulateTransaction(
+        new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASES[this.network],
+        })
+          .addOperation(
+            this.contract.call(
+              "get_streams_by_sender",
+              nativeToScVal(sender, { type: "address" })
+            )
           )
-        )
-        .setTimeout(30)
-        .build()
+          .setTimeout(30)
+          .build()
+      )
     );
 
     if (rpc.Api.isSimulationError(result)) return [];
@@ -306,19 +449,23 @@ export class SoroStreamClient {
    * @param recipient - The recipient address to query.
    */
   async getStreamsByRecipient(recipient: string): Promise<Stream[]> {
-    const result = await this.server.simulateTransaction(
-      new TransactionBuilder(
-        await this.server.getAccount(await this.walletAdapter.getPublicKey()),
-        { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
-      )
-        .addOperation(
-          this.contract.call(
-            "get_streams_by_recipient",
-            nativeToScVal(recipient, { type: "address" })
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
+    const result = await this.withBreaker(() =>
+      this.server.simulateTransaction(
+        new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASES[this.network],
+        })
+          .addOperation(
+            this.contract.call(
+              "get_streams_by_recipient",
+              nativeToScVal(recipient, { type: "address" })
+            )
           )
-        )
-        .setTimeout(30)
-        .build()
+          .setTimeout(30)
+          .build()
+      )
     );
 
     if (rpc.Api.isSimulationError(result)) return [];
@@ -328,5 +475,12 @@ export class SoroStreamClient {
 
     const raw = scValToNative(returnVal) as xdr.ScVal[];
     return raw.map(scValToStream);
+  }
+
+  /**
+   * Returns the underlying CircuitBreaker instance, if configured.
+   */
+  getCircuitBreaker(): CircuitBreaker | null {
+    return this.breaker;
   }
 }

@@ -70,3 +70,22 @@ export interface WalletAdapter {
   signTransaction(xdr: string, network: Network): Promise<string>;
   isConnected(): Promise<boolean>;
 }
+
+/** Options that can be passed to any write method. */
+export interface WriteOptions {
+  /** When true, simulates the transaction and returns the result without signing or broadcasting. */
+  simulateOnly?: boolean;
+}
+
+/** Parameters for creating multiple streams in a single transaction. */
+export interface CreateStreamsParams {
+  streams: CreateStreamParams[];
+}
+
+/** Circuit-breaker configuration. */
+export interface CircuitBreakerOptions {
+  /** Max consecutive failures before tripping the circuit. Default: 3 */
+  threshold?: number;
+  /** Cooldown in milliseconds before retrying after a trip. Default: 30000 */
+  cooldownMs?: number;
+}
