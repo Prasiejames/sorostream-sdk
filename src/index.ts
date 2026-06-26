@@ -19,6 +19,7 @@ export type { CircuitState } from "./circuitBreaker.js";
 export type {
   Stream,
   StreamStatus,
+  StreamFilterCriteria,
   CreateStreamParams,
   CreateStreamsParams,
   WithdrawParams,
