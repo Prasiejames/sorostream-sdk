@@ -8,12 +8,21 @@ import {
   scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
+import { EventPoller } from "./events.js";
 import type {
+  BatchWithdrawResult,
+  BulkCreateOptions,
+  BulkCreateResult,
   CancelStreamParams,
   CreateStreamParams,
   FeeEstimate,
   Network,
+  PaginatedStreams,
+  PaginationParams,
   Stream,
+  StreamEvent,
+  StreamEventFilter,
+  StreamSubscription,
   TopUpParams,
   WalletAdapter,
   WithdrawParams,
@@ -79,6 +88,7 @@ export class SoroStreamClient {
   private readonly network: Network;
   private readonly walletAdapter: WalletAdapter;
   private readonly txTimeoutMs: number;
+  private eventPoller: EventPoller | null = null;
 
   constructor(options: SoroStreamClientOptions) {
     this.network = options.network;
@@ -150,6 +160,46 @@ export class SoroStreamClient {
     return result.hash;
   }
 
+  private async buildAndSubmitBatch(operations: xdr.Operation[]): Promise<string> {
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.server.getAccount(publicKey);
+
+    let builder = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASES[this.network],
+    });
+    for (const op of operations) {
+      builder = builder.addOperation(op);
+    }
+    const tx = builder.setTimeout(30).build();
+
+    const preparedTx = await this.server.prepareTransaction(tx);
+    const signedXdr = await this.walletAdapter.signTransaction(
+      preparedTx.toXDR(),
+      this.network
+    );
+
+    const result = await this.server.sendTransaction(
+      TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+    );
+
+    if (result.status === "ERROR") {
+      throw new Error(`Transaction failed: ${JSON.stringify(result.errorResult)}`);
+    }
+
+    let response = await this.server.getTransaction(result.hash);
+    while (response.status === "NOT_FOUND") {
+      await new Promise((r) => setTimeout(r, 1000));
+      response = await this.server.getTransaction(result.hash);
+    }
+
+    if (response.status === "FAILED") {
+      throw new Error(`Transaction failed: ${result.hash}`);
+    }
+
+    return result.hash;
+  }
+
   /**
    * Creates a new payment stream.
    * @param params - Stream creation parameters.
@@ -177,7 +227,8 @@ export class SoroStreamClient {
     const txHash = await this.buildAndSubmit(operation, signal);
 
     // Fetch latest stream for sender to get ID
-    const streams = await this.getStreamsBySender(sender);
+    const result = await this.getStreamsBySender(sender);
+    const streams = Array.isArray(result) ? result : result.streams;
     const latest = streams[streams.length - 1];
     if (!latest) throw new Error("Stream not found after creation");
 
@@ -204,6 +255,51 @@ export class SoroStreamClient {
 
     const txHash = await this.buildAndSubmit(operation, signal);
     return { txHash, amount: claimable.toString() };
+  }
+
+  /**
+   * Withdraws from multiple streams in a single transaction.
+   * Streams are grouped into batches to stay within Stellar's per-transaction
+   * operation limit. Each batch becomes one submitted transaction.
+   *
+   * @param streamIds - Array of stream IDs to withdraw from.
+   * @param batchSize - Max operations per transaction (default 8).
+   * @returns Array of batch results, one per transaction.
+   *
+   * @example
+   * ```ts
+   * const results = await client.batchWithdraw(["1", "2", "3"]);
+   * for (const b of results) console.log(b.txHash, b.amounts);
+   * ```
+   */
+  async batchWithdraw(
+    streamIds: string[],
+    batchSize = 8
+  ): Promise<BatchWithdrawResult[]> {
+    const results: BatchWithdrawResult[] = [];
+    const recipient = await this.walletAdapter.getPublicKey();
+
+    for (let i = 0; i < streamIds.length; i += batchSize) {
+      const chunk = streamIds.slice(i, i + batchSize);
+      const operations = chunk.map((id) =>
+        this.contract.call(
+          "withdraw",
+          nativeToScVal(BigInt(id), { type: "u64" }),
+          nativeToScVal(recipient, { type: "address" })
+        )
+      );
+
+      const amounts: string[] = [];
+      for (const id of chunk) {
+        const claimable = await this.getClaimable(id);
+        amounts.push(claimable.toString());
+      }
+
+      const txHash = await this.buildAndSubmitBatch(operations);
+      results.push({ txHash, streamIds: chunk, amounts });
+    }
+
+    return results;
   }
 
   /**
@@ -352,6 +448,41 @@ export class SoroStreamClient {
     );
 
     return this.estimateOperationFee(operation);
+  private getEventPoller(): EventPoller {
+    if (!this.eventPoller) {
+      this.eventPoller = new EventPoller(this.server, this.contract.contractId());
+    }
+    return this.eventPoller;
+  }
+
+  /**
+   * Subscribes to real-time stream lifecycle events matching the given filter.
+   * The callback is invoked each time a matching event is detected.
+   *
+   * @example
+   * ```ts
+   * const sub = client.subscribeEvents({ streamId: "42" }, (event) => {
+   *   console.log(event.type, event.streamId);
+   * });
+   * // later: sub.unsubscribe();
+   * ```
+   */
+  subscribeEvents(
+    filter: StreamEventFilter,
+    callback: (event: StreamEvent) => void
+  ): StreamSubscription {
+    const poller = this.getEventPoller();
+    const key = `${filter.streamId ?? "*"}:${filter.sender ?? "*"}:${filter.recipient ?? "*"}:${Date.now()}`;
+
+    return poller.subscribe(key, {
+      filter: (event) => {
+        if (filter.streamId && event.streamId !== filter.streamId) return false;
+        if (filter.sender && event.data.sender !== filter.sender) return false;
+        if (filter.recipient && event.data.recipient !== filter.recipient) return false;
+        return true;
+      },
+      callback,
+    });
   }
 
   /**
@@ -412,59 +543,169 @@ export class SoroStreamClient {
 
   /**
    * Returns all streams created by a sender address.
+   * When `pagination` is omitted, returns the full result set (backward-compatible).
+   *
    * @param sender - The sender address to query.
+   * @param pagination - Optional limit/cursor for paginated results.
    */
-  async getStreamsBySender(sender: string): Promise<Stream[]> {
+  async getStreamsBySender(
+    sender: string,
+    pagination?: PaginationParams
+  ): Promise<Stream[] | PaginatedStreams> {
+    const args: xdr.ScVal[] = [nativeToScVal(sender, { type: "address" })];
+
+    if (pagination) {
+      args.push(nativeToScVal(pagination.limit ?? 20, { type: "u32" }));
+      args.push(
+        pagination.cursor != null
+          ? nativeToScVal(BigInt(pagination.cursor), { type: "u64" })
+          : xdr.ScVal.scvVoid()
+      );
+    }
+
     const result = await this.server.simulateTransaction(
       new TransactionBuilder(
         await this.server.getAccount(await this.walletAdapter.getPublicKey()),
         { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
       )
-        .addOperation(
-          this.contract.call(
-            "get_streams_by_sender",
-            nativeToScVal(sender, { type: "address" })
-          )
-        )
+        .addOperation(this.contract.call("get_streams_by_sender", ...args))
         .setTimeout(30)
         .build()
     );
 
-    if (rpc.Api.isSimulationError(result)) return [];
+    if (rpc.Api.isSimulationError(result)) {
+      return pagination ? { streams: [], cursor: null, hasMore: false } : [];
+    }
 
     const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) return [];
+    if (!returnVal) {
+      return pagination ? { streams: [], cursor: null, hasMore: false } : [];
+    }
 
     const raw = scValToNative(returnVal) as xdr.ScVal[];
-    return raw.map(scValToStream);
+    const streams = raw.map(scValToStream);
+
+    if (!pagination) return streams;
+
+    const p = pagination!;
+    const limit = p.limit ?? 20;
+    const last = streams[streams.length - 1];
+    return {
+      streams,
+      cursor: last ? last.id : null,
+      hasMore: streams.length >= limit,
+    };
   }
 
   /**
    * Returns all streams targeting a recipient address.
+   * When `pagination` is omitted, returns the full result set (backward-compatible).
+   *
    * @param recipient - The recipient address to query.
+   * @param pagination - Optional limit/cursor for paginated results.
    */
-  async getStreamsByRecipient(recipient: string): Promise<Stream[]> {
+  async getStreamsByRecipient(
+    recipient: string,
+    pagination?: PaginationParams
+  ): Promise<Stream[] | PaginatedStreams> {
+    const args: xdr.ScVal[] = [nativeToScVal(recipient, { type: "address" })];
+
+    if (pagination) {
+      args.push(nativeToScVal(pagination.limit ?? 20, { type: "u32" }));
+      args.push(
+        pagination.cursor != null
+          ? nativeToScVal(BigInt(pagination.cursor), { type: "u64" })
+          : xdr.ScVal.scvVoid()
+      );
+    }
+
     const result = await this.server.simulateTransaction(
       new TransactionBuilder(
         await this.server.getAccount(await this.walletAdapter.getPublicKey()),
         { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
       )
-        .addOperation(
-          this.contract.call(
-            "get_streams_by_recipient",
-            nativeToScVal(recipient, { type: "address" })
-          )
-        )
+        .addOperation(this.contract.call("get_streams_by_recipient", ...args))
         .setTimeout(30)
         .build()
     );
 
-    if (rpc.Api.isSimulationError(result)) return [];
+    if (rpc.Api.isSimulationError(result)) {
+      return pagination ? { streams: [], cursor: null, hasMore: false } : [];
+    }
 
     const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) return [];
+    if (!returnVal) {
+      return pagination ? { streams: [], cursor: null, hasMore: false } : [];
+    }
 
     const raw = scValToNative(returnVal) as xdr.ScVal[];
-    return raw.map(scValToStream);
+    const streams = raw.map(scValToStream);
+
+    if (!pagination) return streams;
+
+    const p = pagination!;
+    const limit = p.limit ?? 20;
+    const last = streams[streams.length - 1];
+    return {
+      streams,
+      cursor: last ? last.id : null,
+      hasMore: streams.length >= limit,
+    };
+  }
+
+  /**
+   * Creates multiple streams in bulk, batching operations into transactions.
+   *
+   * Rows are grouped into batches (default 8 per transaction). When a batch fits
+   * within one Soroban transaction it is submitted together; batches beyond the
+   * per-transaction operation limit are submitted as sequential transactions.
+   *
+   * @param rows - Array of stream rows (recipient, amount, durationSeconds).
+   * @param options - Shared token contract address, optional autoRenew and batchSize.
+   * @returns Per-batch results with stream IDs and transaction hashes.
+   *
+   * @example
+   * ```ts
+   * const { batches } = await client.bulkCreateStreams(
+   *   [{ recipient: "G...", amount: toStroops("100"), durationSeconds: 86400 }],
+   *   { token: "GUSDC...", autoRenew: false }
+   * );
+   * ```
+   */
+  async bulkCreateStreams(
+    rows: import("./types.js").BulkStreamRow[],
+    options: BulkCreateOptions
+  ): Promise<BulkCreateResult> {
+    const sender = await this.walletAdapter.getPublicKey();
+    const token = options.token;
+    const autoRenew = options.autoRenew ?? false;
+    const batchSize = options.batchSize ?? 8;
+
+    const results: BulkCreateResult["batches"] = [];
+
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const chunk = rows.slice(i, i + batchSize);
+      const operations = chunk.map((row) =>
+        this.contract.call(
+          "create_stream",
+          nativeToScVal(sender, { type: "address" }),
+          nativeToScVal(row.recipient, { type: "address" }),
+          nativeToScVal(token, { type: "address" }),
+          nativeToScVal(row.amount, { type: "i128" }),
+          nativeToScVal(row.durationSeconds, { type: "u64" }),
+          nativeToScVal(autoRenew, { type: "bool" })
+        )
+      );
+
+      const txHash = await this.buildAndSubmitBatch(operations);
+
+      const streams = await this.getStreamsBySender(sender);
+      const newStreams = streams.slice(-chunk.length);
+      const streamIds = newStreams.map((s) => s.id);
+
+      results.push({ txHash, streamIds, rows: chunk });
+    }
+
+    return { batches: results };
   }
 }
