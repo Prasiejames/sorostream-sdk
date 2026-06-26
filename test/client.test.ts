@@ -45,6 +45,10 @@ import { Contract } from "@stellar/stellar-sdk";
 const VALID_ACCOUNT = "GDDZFLD7ZQTSSDLWEMSD6UML2MTU4KKNCH765GZOVHAYKZNRJMWV4GMF";
 const VALID_CONTRACT = "CAVTXNC2WCHINDNP4VBLSOQA2667VE3RPQZNGD5TFI4U2QSHTVAC667T";
 
+const MOCK_SENDER = Keypair.random().publicKey();
+const MOCK_RECIPIENT = Keypair.random().publicKey();
+const MOCK_TOKEN = Keypair.random().publicKey();
+
 // ── Utility tests ────────────────────────────────────────────────────────────
 
 describe("toStroops", () => {
@@ -670,7 +674,7 @@ describe("SoroStreamClient batchWithdraw", () => {
       walletAdapter: mockAdapter,
     });
 
-    vi.spyOn(client as any, "buildAndSubmitBatch").mockResolvedValue("txhash_batch");
+    vi.spyOn(client, "executeBatch").mockResolvedValue("txhash_batch");
     vi.spyOn(client, "getClaimable").mockResolvedValue(500n);
   });
 
@@ -712,7 +716,7 @@ describe("SoroStreamClient bulkCreateStreams", () => {
       walletAdapter: mockAdapter,
     });
 
-    vi.spyOn(client as any, "buildAndSubmitBatch").mockResolvedValue("txhash_bulk");
+    vi.spyOn(client, "executeBatch").mockResolvedValue("txhash_bulk");
   });
 
   it("processes rows and returns batch results", async () => {
@@ -1342,3 +1346,83 @@ function makeStream(overrides: Partial<Stream> = {}): Stream {
     ...overrides,
   };
 }
+
+describe("executeBatch", () => {
+  it("submits a batch of operations", async () => {
+    const mockAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(MOCK_SENDER),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+    const client = new SoroStreamClient({
+      network: "testnet",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      walletAdapter: mockAdapter,
+    });
+    vi.spyOn(client, "executeBatch").mockResolvedValue("txhash_batch");
+
+    const op = client["contract"].call("withdraw", nativeToScVal(1n, { type: "u64" }), nativeToScVal(MOCK_RECIPIENT, { type: "address" }));
+    const txHash = await client.executeBatch([op]);
+    expect(txHash).toBe("txhash_batch");
+  });
+});
+
+describe("createStream duplicate check", () => {
+  it("warns or blocks duplicate streams when enabled", async () => {
+    const mockAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(MOCK_SENDER),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+    const client = new SoroStreamClient({
+      network: "testnet",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      walletAdapter: mockAdapter,
+      checkDuplicate: true,
+    });
+
+    const now = Math.floor(Date.now() / 1000);
+    vi.spyOn(client, "getStreamsBySender").mockResolvedValue([
+      makeStream({
+        recipient: MOCK_RECIPIENT,
+        token: MOCK_TOKEN,
+        deposit: 100n,
+        flowRate: 10n,
+        startTime: now - 30,
+        endTime: now + 30,
+        status: "Active",
+      }),
+    ]);
+
+    await expect(
+      client.createStream({
+        recipient: MOCK_RECIPIENT,
+        token: MOCK_TOKEN,
+        amount: 100n,
+        durationSeconds: 60,
+        autoRenew: false,
+      })
+    ).rejects.toThrow(DuplicateStreamError);
+  });
+});
+
+describe("createLedgerAdapter", () => {
+  it("signs transaction hash and returns public key", async () => {
+    const mockTransport = { decorateAppAPIMethods: vi.fn() };
+    const mockSignature = Buffer.from("signature");
+    const mockPublicKey = MOCK_SENDER;
+
+    // mock require("@ledgerhq/hw-app-str")
+    const hwAppStrModule = require("@ledgerhq/hw-app-str");
+    const StrClass = hwAppStrModule.default || hwAppStrModule;
+    vi.spyOn(StrClass.prototype, "getPublicKey").mockResolvedValue({ publicKey: mockPublicKey });
+    vi.spyOn(StrClass.prototype, "signHash").mockResolvedValue({ signature: mockSignature });
+
+    const adapter = createLedgerAdapter({
+      transport: mockTransport,
+    });
+
+    expect(await adapter.isConnected()).toBe(true);
+    expect(await adapter.getPublicKey()).toBe(mockPublicKey);
+  });
+});

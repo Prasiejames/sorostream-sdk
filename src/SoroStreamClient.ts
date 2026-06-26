@@ -196,6 +196,8 @@ export class SoroStreamClient {
 
       response = await this.server.getTransaction(result.hash);
     }
+    return fn();
+  }
 
     if (response.status === "FAILED") {
       throw new TransactionFailedError(result.hash);
@@ -259,7 +261,7 @@ export class SoroStreamClient {
       .addOperation(operation)
       .setTimeout(30)
       .build();
-    return this.withBreaker(() => this.server.simulateTransaction(tx));
+    return this.rpcCall("simulateTransaction", () => this.server.simulateTransaction(tx));
   }
 
   // ── Pre-flight validation (Issue 2) ───────────────────────────────────────
@@ -416,7 +418,7 @@ export class SoroStreamClient {
         amounts.push(claimable.toString());
       }
 
-      const txHash = await this.buildAndSubmitBatch(operations);
+      const txHash = await this.executeBatch(operations);
       results.push({ txHash, streamIds: chunk, amounts });
     }
 
@@ -844,7 +846,7 @@ export class SoroStreamClient {
         })
       );
 
-      const txHash = await this.buildAndSubmitBatch(operations);
+      const txHash = await this.executeBatch(operations);
 
       const result = await this.getStreamsBySender(sender);
       const streams = Array.isArray(result) ? result : result.streams;

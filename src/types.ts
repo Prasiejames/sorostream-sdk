@@ -100,6 +100,8 @@ export interface CreateStreamParams {
   durationSeconds: number;
   /** Whether to auto-renew on completion. */
   autoRenew: boolean;
+  /** Opt-in check for duplicate stream creation. */
+  checkDuplicate?: boolean;
 }
 
 /** Alias for a bulk stream creation params array. */
