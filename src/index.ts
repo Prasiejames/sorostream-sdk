@@ -1,9 +1,6 @@
 export { SoroStreamClient } from "./SoroStreamClient.js";
-export type { SoroStreamClientOptions } from "./SoroStreamClient.js";
+export type { SoroStreamClientOptions, SimulateOnlyResult } from "./SoroStreamClient.js";
 
-// Wallet adapters are available at "@sorostream/sdk/wallets" to keep the core
-// bundle free of browser-only @stellar/freighter-api code. The non-browser
-// multisig and claim-delegate adapters are still re-exported here for convenience.
 export { createMultisigAdapter, createClaimDelegateAdapter } from "./wallet.js";
 export type { ClaimDelegateConfig } from "./wallet.js";
 
@@ -12,6 +9,9 @@ export { WebhookForwarder } from "./webhook.js";
 export {
   toStroops,
   formatUSDC,
+  formatToken,
+  toFiatDisplay,
+  isValidStellarAddress,
   calculateFlowRate,
   timeUntilStreamEnd,
   claimableNow,
@@ -22,7 +22,21 @@ export {
 } from "./utils.js";
 export { templates } from "./templates.js";
 export { CircuitBreaker } from "./circuitBreaker.js";
-export type { CircuitState } from "./circuitBreaker.js";
+export type { CircuitState, CircuitBreakerOptions } from "./circuitBreaker.js";
+export { createContractEncoder } from "./contractEncoders.js";
+export type { ContractCallEncoder } from "./contractEncoders.js";
+export { createSimplePriceFeed } from "./priceFeed.js";
+export type { SimplePriceFeedOptions } from "./priceFeed.js";
+export {
+  SoroStreamError,
+  InsufficientAmountError,
+  StreamNotFoundError,
+  StreamNotActiveError,
+  TransactionFailedError,
+  InvalidAddressError,
+  AccountNotFoundError,
+  InsufficientBalanceError,
+} from "./errors.js";
 export type {
   Stream,
   StreamStatus,
@@ -34,7 +48,6 @@ export type {
   TopUpParams,
   Network,
   WalletAdapter,
-  SoroStreamClientOptions,
   FeeEstimate,
   VestingSchedulePoint,
   VestingScheduleResult,
@@ -53,5 +66,8 @@ export type {
   PaginationParams,
   PaginatedStreams,
   WebhookConfig,
+  PriceFeedAdapter,
+  FeeBumpOptions,
+  WriteOptions,
+  ContractVersion,
 } from "./types.js";
-export type { SoroStreamClientOptions } from "./SoroStreamClient.js";
