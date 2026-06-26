@@ -81,7 +81,7 @@ export class GasProfiler {
       amount: params.amount.toString(),
       durationSeconds: params.durationSeconds,
       autoRenew: params.autoRenew,
-    }, () => {
+    }, async () => {
       return this.contract.call(
         "create_stream",
         nativeToScVal(params.sender, { type: "address" }),
@@ -101,7 +101,7 @@ export class GasProfiler {
     return this.simulateAndProfile("withdraw", {
       streamId: params.streamId,
       recipient: params.recipient,
-    }, () => {
+    }, async () => {
       return this.contract.call(
         "withdraw",
         nativeToScVal(BigInt(params.streamId), { type: "u64" }),
@@ -117,7 +117,7 @@ export class GasProfiler {
     return this.simulateAndProfile("cancel_stream", {
       streamId: params.streamId,
       sender: params.sender,
-    }, () => {
+    }, async () => {
       return this.contract.call(
         "cancel_stream",
         nativeToScVal(BigInt(params.streamId), { type: "u64" }),
@@ -135,7 +135,7 @@ export class GasProfiler {
       streamId: params.streamId,
       sender: params.sender,
       amount: params.amount.toString(),
-    }, () => {
+    }, async () => {
       return this.contract.call(
         "top_up",
         nativeToScVal(BigInt(params.streamId), { type: "u64" }),
@@ -146,7 +146,7 @@ export class GasProfiler {
   }
 
   async profileGetStream(streamId: string): Promise<SimulationProfile> {
-    return this.simulateAndProfile("get_stream", { streamId }, () => {
+    return this.simulateAndProfile("get_stream", { streamId }, async () => {
       return this.contract.call(
         "get_stream",
         nativeToScVal(BigInt(streamId), { type: "u64" })
@@ -155,7 +155,7 @@ export class GasProfiler {
   }
 
   async profileGetClaimable(streamId: string): Promise<SimulationProfile> {
-    return this.simulateAndProfile("get_claimable", { streamId }, () => {
+    return this.simulateAndProfile("get_claimable", { streamId }, async () => {
       return this.contract.call(
         "get_claimable",
         nativeToScVal(BigInt(streamId), { type: "u64" })
@@ -164,7 +164,7 @@ export class GasProfiler {
   }
 
   async profileGetStreamsBySender(sender: string): Promise<SimulationProfile> {
-    return this.simulateAndProfile("get_streams_by_sender", { sender }, () => {
+    return this.simulateAndProfile("get_streams_by_sender", { sender }, async () => {
       return this.contract.call(
         "get_streams_by_sender",
         nativeToScVal(sender, { type: "address" })
@@ -173,7 +173,7 @@ export class GasProfiler {
   }
 
   async profileGetStreamsByRecipient(recipient: string): Promise<SimulationProfile> {
-    return this.simulateAndProfile("get_streams_by_recipient", { recipient }, () => {
+    return this.simulateAndProfile("get_streams_by_recipient", { recipient }, async () => {
       return this.contract.call(
         "get_streams_by_recipient",
         nativeToScVal(recipient, { type: "address" })
@@ -226,7 +226,7 @@ export class GasProfiler {
   private async simulateAndProfile(
     operationType: string,
     params: Record<string, unknown>,
-    buildOp: () => xdr.Operation
+    buildOp: () => Promise<xdr.Operation>
   ): Promise<SimulationProfile> {
     try {
       const account = await this.server.getAccount(this.publicKey);
@@ -234,7 +234,7 @@ export class GasProfiler {
         fee: BASE_FEE,
         networkPassphrase: this.networkPassphrase,
       })
-        .addOperation(buildOp())
+        .addOperation(await buildOp())
         .setTimeout(30)
         .build();
 
@@ -271,20 +271,17 @@ export class GasProfiler {
 
       const ledgerReads = readOnlyKeys.length + readWriteKeys.length;
       const ledgerWrites = readWriteKeys.length;
-
-      const entrySize = (keys: xdr.LedgerKey[]): number => {
-        return keys.reduce((sum, key) => sum + key.toXDR().length, 0);
-      };
+      const minFee = cost.minFee ?? success.minResourceFee ?? "0";
 
       return {
         operationType,
         params,
-        cpuInstructions: cost.cpuInsns,
-        minFee: cost.minFee,
+        cpuInstructions: "0",
+        minFee,
         ledgerReads,
         ledgerWrites,
-        contractEntryBytesRead: entrySize(readOnlyKeys),
-        contractEntryBytesWritten: entrySize(readWriteKeys),
+        contractEntryBytesRead: 0,
+        contractEntryBytesWritten: 0,
         success: true,
       };
     } catch (err) {

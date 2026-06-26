@@ -33,9 +33,7 @@ export type { RetryOptions } from "./retry.js";
 export type {
   Stream,
   StreamStatus,
-  StreamFilterCriteria,
   CreateStreamParams,
-  CreateStreamsParams,
   WithdrawParams,
   CancelStreamParams,
   TopUpParams,

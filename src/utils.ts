@@ -1,10 +1,10 @@
 import { SoroStreamError } from "./errors.js";
 import type {
   Stream,
-  VestingScheduleResult,
-  WatchClaimableOptions,
   BulkStreamRow,
   TokenAggregate,
+  VestingScheduleResult,
+  WatchClaimableOptions,
   FormatUSDCOptions,
   StreamDrift,
   ReconcileStreamOptions,
@@ -132,7 +132,7 @@ export function calculateVestingSchedule(
   } else {
     const elapsed = currentTime - Math.max(cliffEndTime, stream.startTime);
     effectiveClaimable = stream.flowRate * BigInt(Math.max(0, elapsed));
-    if (effectiveClaimable > totalAmount) effectiveClaimable = totalAmount;
+    if (currentTime >= stream.endTime) effectiveClaimable = totalAmount;
   }
 
   const milestones: Array<{ time: number; vested: bigint }> = [];
@@ -325,6 +325,7 @@ export function watchStreamDrift(
 }
 
 // ── Token aggregation ─────────────────────────────────────────────────────────
+
 
 /**
  * Groups streams by token address and returns per-token aggregates.

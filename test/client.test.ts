@@ -7,6 +7,7 @@ const TEST_PK = TEST_KEYPAIR.publicKey();
 // A valid Stellar contract address (C-address) for use as a token address.
 const TEST_TOKEN = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
+
 import { SoroStreamClient } from "../src/SoroStreamClient.js";
 import { createKeypairAdapter, createPasskeyAdapter } from "../src/wallet.js";
 import type { Stream, WalletAdapter, BulkStreamRow } from "../src/types.js";

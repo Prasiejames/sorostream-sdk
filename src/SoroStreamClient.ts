@@ -15,7 +15,7 @@ import {
   InsufficientAmountError,
 } from "./errors.js";
 import { CircuitBreaker } from "./circuitBreaker.js";
-import type { CircuitBreakerOptions as CircuitBreakerOptionsType } from "./circuitBreaker.js";
+import type { CircuitBreakerOptions } from "./circuitBreaker.js";
 import { withRetry } from "./retry.js";
 import type {
   BatchWithdrawResult,
@@ -23,7 +23,6 @@ import type {
   BulkCreateResult,
   CancelStreamParams,
   CreateStreamParams,
-  CreateStreamsParams,
   FeeEstimate,
   Network,
   PaginatedStreams,
@@ -37,6 +36,7 @@ import type {
   WithdrawParams,
   WriteOptions,
   StreamFilterCriteria,
+  CreateStreamsParams,
 } from "./types.js";
 import type { RetryOptions } from "./retry.js";
 
@@ -63,7 +63,7 @@ export interface SoroStreamClientOptions {
   /** Optional custom RPC URL (overrides default). */
   rpcUrl?: string;
   /** Optional circuit-breaker configuration for RPC calls. */
-  circuitBreaker?: CircuitBreakerOptionsType;
+  circuitBreaker?: CircuitBreakerOptions;
   /** Maximum time in ms to wait for a transaction to confirm (default: 120000). */
   txTimeoutMs?: number;
   /** Retry policy for read methods (getStream, getClaimable, etc.). */
@@ -193,6 +193,7 @@ export class SoroStreamClient {
 
     return result.hash;
   }
+
 
   private async buildAndSubmitBatch(operations: xdr.Operation[]): Promise<string> {
     const publicKey = await this.walletAdapter.getPublicKey();
