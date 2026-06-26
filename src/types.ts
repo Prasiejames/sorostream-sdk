@@ -70,3 +70,21 @@ export interface WalletAdapter {
   signTransaction(xdr: string, network: Network): Promise<string>;
   isConnected(): Promise<boolean>;
 }
+
+/** Options for constructing a SoroStreamClient. */
+export interface SoroStreamClientOptions {
+  /** The Stellar network to connect to. */
+  network: Network;
+  /** The deployed StreamContract address. */
+  contractId: string;
+  /** Wallet adapter for signing transactions. */
+  walletAdapter: WalletAdapter;
+  /** Optional custom RPC URL (overrides default). */
+  rpcUrl?: string;
+  /** Cache TTL in milliseconds for read queries (getStream, getClaimable, etc.). Set to 0 to disable caching. Defaults to 0 (disabled). */
+  cacheTtlMs?: number;
+  /** Maximum number of concurrent in-flight RPC calls. Defaults to 10. */
+  maxConcurrentRpc?: number;
+  /** Enable OpenTelemetry instrumentation spans. Requires @opentelemetry/api to be installed. Defaults to false. */
+  telemetry?: boolean;
+}

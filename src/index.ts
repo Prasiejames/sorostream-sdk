@@ -7,6 +7,15 @@ export {
   timeUntilStreamEnd,
   claimableNow,
 } from "./utils.js";
+export { Cache } from "./cache.js";
+export { RateLimiter } from "./rate-limiter.js";
+export { Telemetry } from "./telemetry.js";
+export { GasProfiler } from "./profiler.js";
+export type {
+  SimulationProfile,
+  ProfileReport,
+  ProfilerConfig,
+} from "./profiler.js";
 export type {
   Stream,
   StreamStatus,
