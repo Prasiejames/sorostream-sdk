@@ -10,6 +10,9 @@ import {
 } from "@stellar/stellar-sdk";
 import { EventPoller } from "./events.js";
 import type {
+  BatchWithdrawResult,
+  BulkCreateOptions,
+  BulkCreateResult,
   CancelStreamParams,
   CreateStreamParams,
   Network,
@@ -132,6 +135,46 @@ export class SoroStreamClient {
     return result.hash;
   }
 
+  private async buildAndSubmitBatch(operations: xdr.Operation[]): Promise<string> {
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.server.getAccount(publicKey);
+
+    let builder = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASES[this.network],
+    });
+    for (const op of operations) {
+      builder = builder.addOperation(op);
+    }
+    const tx = builder.setTimeout(30).build();
+
+    const preparedTx = await this.server.prepareTransaction(tx);
+    const signedXdr = await this.walletAdapter.signTransaction(
+      preparedTx.toXDR(),
+      this.network
+    );
+
+    const result = await this.server.sendTransaction(
+      TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+    );
+
+    if (result.status === "ERROR") {
+      throw new Error(`Transaction failed: ${JSON.stringify(result.errorResult)}`);
+    }
+
+    let response = await this.server.getTransaction(result.hash);
+    while (response.status === "NOT_FOUND") {
+      await new Promise((r) => setTimeout(r, 1000));
+      response = await this.server.getTransaction(result.hash);
+    }
+
+    if (response.status === "FAILED") {
+      throw new Error(`Transaction failed: ${result.hash}`);
+    }
+
+    return result.hash;
+  }
+
   /**
    * Creates a new payment stream.
    * @param params - Stream creation parameters.
@@ -183,6 +226,51 @@ export class SoroStreamClient {
 
     const txHash = await this.buildAndSubmit(operation);
     return { txHash, amount: claimable.toString() };
+  }
+
+  /**
+   * Withdraws from multiple streams in a single transaction.
+   * Streams are grouped into batches to stay within Stellar's per-transaction
+   * operation limit. Each batch becomes one submitted transaction.
+   *
+   * @param streamIds - Array of stream IDs to withdraw from.
+   * @param batchSize - Max operations per transaction (default 8).
+   * @returns Array of batch results, one per transaction.
+   *
+   * @example
+   * ```ts
+   * const results = await client.batchWithdraw(["1", "2", "3"]);
+   * for (const b of results) console.log(b.txHash, b.amounts);
+   * ```
+   */
+  async batchWithdraw(
+    streamIds: string[],
+    batchSize = 8
+  ): Promise<BatchWithdrawResult[]> {
+    const results: BatchWithdrawResult[] = [];
+    const recipient = await this.walletAdapter.getPublicKey();
+
+    for (let i = 0; i < streamIds.length; i += batchSize) {
+      const chunk = streamIds.slice(i, i + batchSize);
+      const operations = chunk.map((id) =>
+        this.contract.call(
+          "withdraw",
+          nativeToScVal(BigInt(id), { type: "u64" }),
+          nativeToScVal(recipient, { type: "address" })
+        )
+      );
+
+      const amounts: string[] = [];
+      for (const id of chunk) {
+        const claimable = await this.getClaimable(id);
+        amounts.push(claimable.toString());
+      }
+
+      const txHash = await this.buildAndSubmitBatch(operations);
+      results.push({ txHash, streamIds: chunk, amounts });
+    }
+
+    return results;
   }
 
   /**
@@ -427,5 +515,61 @@ export class SoroStreamClient {
       cursor: last ? last.id : null,
       hasMore: streams.length >= limit,
     };
+  }
+
+  /**
+   * Creates multiple streams in bulk, batching operations into transactions.
+   *
+   * Rows are grouped into batches (default 8 per transaction). When a batch fits
+   * within one Soroban transaction it is submitted together; batches beyond the
+   * per-transaction operation limit are submitted as sequential transactions.
+   *
+   * @param rows - Array of stream rows (recipient, amount, durationSeconds).
+   * @param options - Shared token contract address, optional autoRenew and batchSize.
+   * @returns Per-batch results with stream IDs and transaction hashes.
+   *
+   * @example
+   * ```ts
+   * const { batches } = await client.bulkCreateStreams(
+   *   [{ recipient: "G...", amount: toStroops("100"), durationSeconds: 86400 }],
+   *   { token: "GUSDC...", autoRenew: false }
+   * );
+   * ```
+   */
+  async bulkCreateStreams(
+    rows: import("./types.js").BulkStreamRow[],
+    options: BulkCreateOptions
+  ): Promise<BulkCreateResult> {
+    const sender = await this.walletAdapter.getPublicKey();
+    const token = options.token;
+    const autoRenew = options.autoRenew ?? false;
+    const batchSize = options.batchSize ?? 8;
+
+    const results: BulkCreateResult["batches"] = [];
+
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const chunk = rows.slice(i, i + batchSize);
+      const operations = chunk.map((row) =>
+        this.contract.call(
+          "create_stream",
+          nativeToScVal(sender, { type: "address" }),
+          nativeToScVal(row.recipient, { type: "address" }),
+          nativeToScVal(token, { type: "address" }),
+          nativeToScVal(row.amount, { type: "i128" }),
+          nativeToScVal(row.durationSeconds, { type: "u64" }),
+          nativeToScVal(autoRenew, { type: "bool" })
+        )
+      );
+
+      const txHash = await this.buildAndSubmitBatch(operations);
+
+      const streams = await this.getStreamsBySender(sender);
+      const newStreams = streams.slice(-chunk.length);
+      const streamIds = newStreams.map((s) => s.id);
+
+      results.push({ txHash, streamIds, rows: chunk });
+    }
+
+    return { batches: results };
   }
 }

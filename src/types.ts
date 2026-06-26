@@ -120,9 +120,54 @@ export interface TopUpParams {
 /** Network configuration. */
 export type Network = "mainnet" | "testnet" | "futurenet";
 
-/** Wallet adapter interface. */
+/** Wallet adapter interface. Implement this to support custom signing backends. */
 export interface WalletAdapter {
   getPublicKey(): Promise<string>;
   signTransaction(xdr: string, network: Network): Promise<string>;
   isConnected(): Promise<boolean>;
+}
+
+/** A single row for bulk stream creation. */
+export interface BulkStreamRow {
+  recipient: string;
+  amount: bigint;
+  durationSeconds: number;
+}
+
+/** Options for bulkCreateStreams. */
+export interface BulkCreateOptions {
+  /** SAC token contract address applied to every row. */
+  token: string;
+  /** Whether auto-renew is enabled (default false). */
+  autoRenew?: boolean;
+  /** Max operations per transaction (default 8). */
+  batchSize?: number;
+}
+
+/** Result of one batch within a bulk create. */
+export interface BulkCreateBatchResult {
+  txHash: string;
+  streamIds: string[];
+  rows: BulkStreamRow[];
+}
+
+/** Full result of bulkCreateStreams. */
+export interface BulkCreateResult {
+  batches: BulkCreateBatchResult[];
+}
+
+/** Result of one transaction within a batchWithdraw call. */
+export interface BatchWithdrawResult {
+  txHash: string;
+  streamIds: string[];
+  amounts: string[];
+}
+
+/** Per-token aggregate of a set of streams. */
+export interface TokenAggregate {
+  token: string;
+  streamCount: number;
+  deposited: bigint;
+  claimable: bigint;
+  claimedSoFar: bigint;
 }

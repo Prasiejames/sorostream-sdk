@@ -8,6 +8,8 @@ export {
   calculateFlowRate,
   timeUntilStreamEnd,
   claimableNow,
+  aggregateStreamsByToken,
+  parseCsvStreamRows,
 } from "./utils.js";
 export type {
   Stream,
@@ -18,6 +20,13 @@ export type {
   TopUpParams,
   Network,
   WalletAdapter,
+  SoroStreamClientOptions,
+  BulkStreamRow,
+  BulkCreateOptions,
+  BulkCreateBatchResult,
+  BulkCreateResult,
+  BatchWithdrawResult,
+  TokenAggregate,
   MultisigSigner,
   StreamEvent,
   StreamEventType,
