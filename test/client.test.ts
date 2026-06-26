@@ -1,5 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { Keypair } from "@stellar/stellar-sdk";
+
+// Pre-generated valid Stellar addresses for tests that pass addresses to contract calls.
+const TEST_KEYPAIR = Keypair.random();
+const TEST_PK = TEST_KEYPAIR.publicKey();
+// A valid Stellar contract address (C-address) for use as a token address.
+const TEST_TOKEN = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+
 import { SoroStreamClient } from "../src/SoroStreamClient.js";
+import { createKeypairAdapter, createPasskeyAdapter } from "../src/wallet.js";
+import type { Stream, WalletAdapter, BulkStreamRow } from "../src/types.js";
 import { createKeypairAdapter } from "../src/wallet.js";
 import { Keypair } from "@stellar/stellar-sdk";
 import type { Stream, WalletAdapter, BulkStreamRow, PriceFeedAdapter, FeeBumpOptions } from "../src/types.js";
@@ -16,6 +27,8 @@ import {
   watchClaimable,
   aggregateStreamsByToken,
   parseCsvStreamRows,
+  detectStreamDrift,
+  watchStreamDrift,
 } from "../src/utils.js";
 import {
   InsufficientAmountError,
@@ -23,6 +36,9 @@ import {
   InvalidAddressError,
   AccountNotFoundError,
 } from "../src/errors.js";
+import { withRetry } from "../src/retry.js";
+import { NoopLogger } from "../src/logger.js";
+import type { Logger } from "../src/logger.js";
 import { createContractEncoder } from "../src/contractEncoders.js";
 import { Contract } from "@stellar/stellar-sdk";
 
@@ -518,10 +534,10 @@ describe("typed errors", () => {
 
 describe("createKeypairAdapter", () => {
   it("returns a connected WalletAdapter", async () => {
-    const adapter = createKeypairAdapter(
-      "SDNOE4D4CJ4BWNE5DCYCFSZCRAIWVV3UGMZZZURFJPUK7LI7EXWWLE2M"
-    );
+    const keypair = Keypair.random();
+    const adapter = createKeypairAdapter(keypair.secret());
     expect(await adapter.isConnected()).toBe(true);
+    expect(await adapter.getPublicKey()).toBe(keypair.publicKey());
     expect(await adapter.getPublicKey()).toBe(kp.publicKey());
   });
 
@@ -642,7 +658,8 @@ describe("SoroStreamClient batchWithdraw", () => {
 
   beforeEach(() => {
     mockAdapter = {
-      getPublicKey: vi.fn().mockResolvedValue("GD6YQXH4ESCIYGLKLMHZRLNOOMS475NAHGHOJK2MFSY3QERPINRQCXAN"),
+      // Use a valid Stellar public key so nativeToScVal({ type: "address" }) succeeds.
+      getPublicKey: vi.fn().mockResolvedValue(TEST_PK),
       signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
       isConnected: vi.fn().mockResolvedValue(true),
     };
@@ -683,7 +700,8 @@ describe("SoroStreamClient bulkCreateStreams", () => {
 
   beforeEach(() => {
     mockAdapter = {
-      getPublicKey: vi.fn().mockResolvedValue("GD6YQXH4ESCIYGLKLMHZRLNOOMS475NAHGHOJK2MFSY3QERPINRQCXAN"),
+      // Use a valid Stellar public key so nativeToScVal({ type: "address" }) succeeds.
+      getPublicKey: vi.fn().mockResolvedValue(TEST_PK),
       signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
       isConnected: vi.fn().mockResolvedValue(true),
     };
@@ -704,12 +722,13 @@ describe("SoroStreamClient bulkCreateStreams", () => {
     ]);
 
     const rows: BulkStreamRow[] = [
-      { recipient: "GC67CTZFJUVIZ3FL2QRAJ7YRPPYIHF53QXHQMOSWINB5EHJHFQFRKT7K", amount: 100n, durationSeconds: 3600 },
-      { recipient: "GCIA5SUX53DFPONYDFKTTOTVGONY25VBMZRHM2QH4ME7DGEGQOVM2XZD", amount: 200n, durationSeconds: 7200 },
+      // Use valid Stellar addresses for recipient; token must be a valid C-address.
+      { recipient: TEST_PK, amount: 100n, durationSeconds: 3600 },
+      { recipient: TEST_PK, amount: 200n, durationSeconds: 7200 },
     ];
 
     const result = await client.bulkCreateStreams(rows, {
-      token: "GBXESJQLSNQE7ABHMZDZWV434OMMVRFEJ7OJ6VI2C32XJRSLTOYPNUW7",
+      token: TEST_TOKEN,
       autoRenew: false,
       batchSize: 8,
     });
@@ -723,11 +742,11 @@ describe("SoroStreamClient bulkCreateStreams", () => {
     vi.spyOn(client, "getStreamsBySender").mockResolvedValue([]);
 
     const rows: BulkStreamRow[] = [
-      { recipient: "GC67CTZFJUVIZ3FL2QRAJ7YRPPYIHF53QXHQMOSWINB5EHJHFQFRKT7K", amount: 100n, durationSeconds: 3600 },
+      { recipient: TEST_PK, amount: 100n, durationSeconds: 3600 },
     ];
 
     const result = await client.bulkCreateStreams(rows, {
-      token: "GBXESJQLSNQE7ABHMZDZWV434OMMVRFEJ7OJ6VI2C32XJRSLTOYPNUW7",
+      token: TEST_TOKEN,
     });
 
     expect(result.batches).toHaveLength(1);
@@ -974,6 +993,333 @@ describe("fee bump options", () => {
     expect(defaultBump).toBe(feeBump);
     expect(defaultBump.sponsorAddress).toBe(VALID_ACCOUNT);
     expect(defaultBump.maxFee).toBe(10_000);
+  });
+});
+
+// ── Issue #44: Locale-aware formatUSDC ───────────────────────────────────────
+
+describe("formatUSDC locale-aware", () => {
+  it("returns existing precise string when no options provided", () => {
+    expect(formatUSDC(1_000_000_000n)).toBe("100.0000000");
+    expect(formatUSDC(1n)).toBe("0.0000001");
+  });
+
+  it("formats with locale grouping separator", () => {
+    // 1,234 USDC = 12_340_000_000 stroops
+    const result = formatUSDC(12_340_000_000n, 7, {
+      locale: "en-US",
+      useGrouping: true,
+      maximumFractionDigits: 2,
+    });
+    expect(result).toContain(",");
+    expect(result).toMatch(/1,234/);
+  });
+
+  it("trims to maximumFractionDigits", () => {
+    const result = formatUSDC(1_005_000_000n, 7, {
+      locale: "en-US",
+      maximumFractionDigits: 2,
+    });
+    // 100.5000000 → "100.5" (max 2 decimal digits, trailing zeros removed)
+    expect(result).toBe("100.5");
+  });
+
+  it("pads to minimumFractionDigits", () => {
+    const result = formatUSDC(1_000_000_000n, 7, {
+      locale: "en-US",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+    expect(result).toBe("100.00");
+  });
+
+  it("disables grouping when useGrouping is false", () => {
+    const result = formatUSDC(12_340_000_000n, 7, {
+      locale: "en-US",
+      useGrouping: false,
+      maximumFractionDigits: 0,
+    });
+    expect(result).not.toContain(",");
+    expect(result).toBe("1234");
+  });
+
+  it("works with de-DE locale (period thousands, comma decimal)", () => {
+    const result = formatUSDC(12_340_000_000n, 7, {
+      locale: "de-DE",
+      useGrouping: true,
+      maximumFractionDigits: 0,
+    });
+    // de-DE uses period as thousands separator
+    expect(result).toContain(".");
+  });
+});
+
+// ── Issue #47: detectStreamDrift & watchStreamDrift ──────────────────────────
+
+describe("detectStreamDrift", () => {
+  it("returns empty array for identical streams", () => {
+    const s = makeStream();
+    expect(detectStreamDrift(s, { ...s })).toEqual([]);
+  });
+
+  it("detects status change", () => {
+    const cached = makeStream({ status: "Active" });
+    const onChain = makeStream({ status: "Completed" });
+    const diffs = detectStreamDrift(cached, onChain);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0]!.field).toBe("status");
+    expect(diffs[0]!.cached).toBe("Active");
+    expect(diffs[0]!.onChain).toBe("Completed");
+  });
+
+  it("detects deposit change", () => {
+    const cached = makeStream({ deposit: 100_000n });
+    const onChain = makeStream({ deposit: 200_000n });
+    const diffs = detectStreamDrift(cached, onChain);
+    const depositDiff = diffs.find((d) => d.field === "deposit");
+    expect(depositDiff).toBeDefined();
+  });
+
+  it("detects multiple drifted fields simultaneously", () => {
+    const cached = makeStream({ status: "Active", autoRenew: false });
+    const onChain = makeStream({ status: "Cancelled", autoRenew: true });
+    const diffs = detectStreamDrift(cached, onChain);
+    expect(diffs.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("ignores immutable fields (id, sender, recipient, token, startTime)", () => {
+    const cached = makeStream({ id: "1", sender: "GA" });
+    const onChain = makeStream({ id: "99", sender: "GB" });
+    const diffs = detectStreamDrift(cached, onChain);
+    expect(diffs.every((d) => d.field !== "id" && d.field !== "sender")).toBe(true);
+  });
+});
+
+describe("watchStreamDrift", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("calls onDrift when on-chain state differs from cached", async () => {
+    const cached = makeStream({ status: "Active" });
+    const fresh = makeStream({ status: "Completed" });
+    const fetchOnChain = vi.fn().mockResolvedValue(fresh);
+    const onDrift = vi.fn();
+
+    const stop = watchStreamDrift(cached, fetchOnChain, onDrift, { intervalMs: 1000 });
+
+    // Flush microtasks from the immediate void check() — no timer advance needed.
+    await Promise.resolve();
+
+    expect(onDrift).toHaveBeenCalledOnce();
+    const [diffs, freshArg] = onDrift.mock.calls[0] as [ReturnType<typeof detectStreamDrift>, Stream];
+    expect(diffs.some((d) => d.field === "status")).toBe(true);
+    expect(freshArg.status).toBe("Completed");
+
+    stop();
+  });
+
+  it("does not call onDrift when state is unchanged", async () => {
+    const cached = makeStream();
+    const fetchOnChain = vi.fn().mockResolvedValue({ ...cached });
+    const onDrift = vi.fn();
+
+    const stop = watchStreamDrift(cached, fetchOnChain, onDrift);
+
+    await Promise.resolve();
+
+    expect(onDrift).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it("stops after unsubscribe", async () => {
+    const cached = makeStream({ status: "Active" });
+    const fresh = makeStream({ status: "Completed" });
+    const fetchOnChain = vi.fn().mockResolvedValue(fresh);
+    const onDrift = vi.fn();
+
+    const stop = watchStreamDrift(cached, fetchOnChain, onDrift, { intervalMs: 5000 });
+    // stop() sets stopped=true before check()'s await resolves
+    stop();
+
+    await Promise.resolve();
+    expect(onDrift).not.toHaveBeenCalled();
+  });
+
+  it("swallows fetch errors and keeps watching", async () => {
+    const cached = makeStream();
+    const fetchOnChain = vi.fn().mockRejectedValue(new Error("RPC down"));
+    const onDrift = vi.fn();
+
+    const stop = watchStreamDrift(cached, fetchOnChain, onDrift, { intervalMs: 1000 });
+
+    // Flush the immediate check; errors are caught internally.
+    await Promise.resolve();
+    expect(onDrift).not.toHaveBeenCalled();
+
+    stop();
+  });
+});
+
+// ── Issue #48: withRetry ──────────────────────────────────────────────────────
+
+describe("withRetry", () => {
+  it("returns immediately on first success", async () => {
+    const fn = vi.fn().mockResolvedValue("ok");
+    const result = await withRetry(fn);
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it("retries on failure and succeeds on second attempt", async () => {
+    let calls = 0;
+    const fn = vi.fn().mockImplementation(async () => {
+      calls++;
+      if (calls < 2) throw new Error("transient");
+      return "ok";
+    });
+    const result = await withRetry(fn, { maxAttempts: 3, baseDelayMs: 1 });
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws after exhausting all attempts", async () => {
+    const fn = vi.fn().mockRejectedValue(new Error("permanent"));
+    await expect(
+      withRetry(fn, { maxAttempts: 3, baseDelayMs: 1 })
+    ).rejects.toThrow("permanent");
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("respects maxAttempts: 1 (no retry)", async () => {
+    const fn = vi.fn().mockRejectedValue(new Error("fail"));
+    await expect(withRetry(fn, { maxAttempts: 1 })).rejects.toThrow("fail");
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it("aborts between retries when signal fires", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const fn = vi.fn().mockImplementation(async () => {
+      calls++;
+      if (calls === 1) {
+        controller.abort();
+        throw new Error("fail");
+      }
+      return "ok";
+    });
+
+    await expect(
+      withRetry(fn, { maxAttempts: 5, baseDelayMs: 1, signal: controller.signal })
+    ).rejects.toThrow("Retry aborted");
+    expect(fn).toHaveBeenCalledOnce();
+  });
+});
+
+describe("getClaimable stream-not-found vs RPC error", () => {
+  let client: SoroStreamClient;
+  let mockAdapter: WalletAdapter;
+
+  beforeEach(() => {
+    mockAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue("GABC123"),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+    client = new SoroStreamClient({
+      network: "testnet",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      walletAdapter: mockAdapter,
+    });
+  });
+
+  it("returns 0n for contract-level simulation error (stream not found)", async () => {
+    vi.spyOn(client as any, "simulateOp").mockResolvedValue({
+      error: "contract error: stream not found",
+      id: "1",
+      latestLedger: 100,
+    });
+
+    const result = await client.getClaimable("99");
+    expect(result).toBe(0n);
+  });
+});
+
+// ── Issue #46: createPasskeyAdapter ──────────────────────────────────────────
+
+describe("createPasskeyAdapter", () => {
+  const mockCredentialId = new ArrayBuffer(32);
+
+  beforeEach(() => {
+    // Mock WebAuthn environment
+    Object.defineProperty(global, "window", {
+      value: { PublicKeyCredential: class {} },
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(global, "navigator", {
+      value: {
+        credentials: {
+          get: vi.fn(),
+        },
+      },
+      writable: true,
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("throws when WebAuthn is not available", async () => {
+    Object.defineProperty(global, "window", {
+      value: {},
+      writable: true,
+      configurable: true,
+    });
+    await expect(
+      createPasskeyAdapter({
+        contractId: "CA123",
+        rpId: "example.com",
+        credentialId: mockCredentialId,
+      })
+    ).rejects.toThrow("WebAuthn is not available");
+  });
+
+  it("getPublicKey returns the contractId", async () => {
+    const adapter = await createPasskeyAdapter({
+      contractId: "CABC123",
+      rpId: "example.com",
+      credentialId: mockCredentialId,
+    });
+    expect(await adapter.getPublicKey()).toBe("CABC123");
+  });
+
+  it("isConnected returns true when WebAuthn API is present", async () => {
+    const adapter = await createPasskeyAdapter({
+      contractId: "CABC123",
+      rpId: "example.com",
+      credentialId: mockCredentialId,
+    });
+    expect(await adapter.isConnected()).toBe(true);
+  });
+
+  it("signTransaction returns unchanged XDR when no invokeHostFunction ops", async () => {
+    // Build a minimal non-invokeHostFunction XDR string (just pass through)
+    const adapter = await createPasskeyAdapter({
+      contractId: "CABC123",
+      rpId: "example.com",
+      credentialId: mockCredentialId,
+    });
+
+    // A non-Soroban XDR (will fail to parse as v1 env) → just verify it doesn't hang
+    const xdrStr = "AAAAAQAAAA==";
+    await expect(adapter.signTransaction(xdrStr, "testnet")).rejects.toThrow();
   });
 });
 

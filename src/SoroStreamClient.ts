@@ -11,6 +11,14 @@ import {
   FeeBumpTransaction,
 } from "@stellar/stellar-sdk";
 import { EventPoller } from "./events.js";
+import {
+  TransactionFailedError,
+  StreamNotFoundError,
+  InsufficientAmountError,
+} from "./errors.js";
+import { CircuitBreaker } from "./circuitBreaker.js";
+import type { CircuitBreakerOptions } from "./circuitBreaker.js";
+import { withRetry } from "./retry.js";
 import type {
   BatchWithdrawResult,
   BulkCreateOptions,
@@ -29,10 +37,11 @@ import type {
   TopUpParams,
   WalletAdapter,
   WithdrawParams,
+  WriteOptions,
+  StreamFilterCriteria,
+  CreateStreamsParams,
 } from "./types.js";
-import { CircuitBreaker } from "./circuitBreaker.js";
-import type { CircuitBreakerOptions } from "./circuitBreaker.js";
-import { InsufficientAmountError, TransactionFailedError, StreamNotFoundError } from "./errors.js";
+import type { RetryOptions } from "./retry.js";
 
 const RPC_URLS: Record<Network, string> = {
   mainnet: "https://soroban.stellar.org",
@@ -60,6 +69,8 @@ export interface SoroStreamClientOptions {
   circuitBreaker?: CircuitBreakerOptions;
   /** Maximum time in ms to wait for a transaction to confirm (default: 120000). */
   txTimeoutMs?: number;
+  /** Retry policy for read methods (getStream, getClaimable, etc.). */
+  readRetry?: RetryOptions;
   /** Optional price-feed adapter for token-to-fiat display conversion. */
   priceFeed?: PriceFeedAdapter;
   /** Contract version to use for call encoding (default: "v1"). */
@@ -102,11 +113,12 @@ export type SimulateOnlyResult = {
  */
 export class SoroStreamClient {
   private readonly server: rpc.Server;
+  private readonly breaker: CircuitBreaker | null;
   private readonly contract: Contract;
   private readonly network: Network;
   private readonly walletAdapter: WalletAdapter;
   private readonly txTimeoutMs: number;
-  private readonly breaker: CircuitBreaker;
+  private readonly readRetry: RetryOptions;
   private eventPoller: EventPoller | null = null;
 
   constructor(options: SoroStreamClientOptions) {
@@ -118,17 +130,22 @@ export class SoroStreamClient {
       { allowHttp: false }
     );
     this.txTimeoutMs = options.txTimeoutMs ?? 120_000;
-    this.breaker = new CircuitBreaker(options.circuitBreaker);
+    this.breaker = options.circuitBreaker
+      ? new CircuitBreaker(options.circuitBreaker)
+      : null;
+    this.readRetry = options.readRetry ?? {};
   }
 
-  private withBreaker<T>(fn: () => Promise<T>): Promise<T> {
-    return this.breaker.call(fn);
+  private async withBreaker<T>(fn: () => Promise<T>): Promise<T> {
+    return this.breaker ? this.breaker.call(fn) : fn();
   }
 
-
-  private async buildAndSubmitBatch(operations: xdr.Operation[]): Promise<string> {
+  private async buildAndSubmit(
+    operation: xdr.Operation,
+    signal?: AbortSignal
+  ): Promise<string> {
     const publicKey = await this.walletAdapter.getPublicKey();
-    const account = await this.server.getAccount(publicKey);
+    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
 
     const tx = new TransactionBuilder(account, {
       fee: BASE_FEE,
@@ -137,6 +154,69 @@ export class SoroStreamClient {
       .addOperation(operation)
       .setTimeout(30)
       .build();
+
+    const preparedTx = await this.withBreaker(() =>
+      this.server.prepareTransaction(tx)
+    );
+    const signedXdr = await this.walletAdapter.signTransaction(
+      preparedTx.toXDR(),
+      this.network
+    );
+
+    const result = await this.withBreaker(() =>
+      this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+      )
+    );
+
+    if (result.status === "ERROR") {
+      throw new TransactionFailedError(JSON.stringify(result.errorResult));
+    }
+
+    // Poll for completion with configurable timeout and exponential backoff
+    const startTime = Date.now();
+    let delay = 500;
+    const maxDelay = 10_000;
+
+    let response = await this.server.getTransaction(result.hash);
+    while (response.status === "NOT_FOUND") {
+      if (signal?.aborted) {
+        throw new DOMException("Transaction polling aborted", "AbortError");
+      }
+
+      const elapsed = Date.now() - startTime;
+      if (elapsed >= this.txTimeoutMs) {
+        throw new Error(
+          `Transaction confirmation timed out after ${this.txTimeoutMs}ms`
+        );
+      }
+
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, maxDelay);
+
+      response = await this.server.getTransaction(result.hash);
+    }
+
+    if (response.status === "FAILED") {
+      throw new TransactionFailedError(result.hash);
+    }
+
+    return result.hash;
+  }
+
+
+  private async buildAndSubmitBatch(operations: xdr.Operation[]): Promise<string> {
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.server.getAccount(publicKey);
+
+    let builder = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASES[this.network],
+    });
+    for (const op of operations) {
+      builder = builder.addOperation(op);
+    }
+    const tx = builder.setTimeout(30).build();
 
     const preparedTx = await this.server.prepareTransaction(tx);
     const signedXdr = await this.walletAdapter.signTransaction(
@@ -149,7 +229,7 @@ export class SoroStreamClient {
     );
 
     if (result.status === "ERROR") {
-      throw new Error(`Transaction failed: ${JSON.stringify(result.errorResult)}`);
+      throw new TransactionFailedError(JSON.stringify(result.errorResult));
     }
 
     let response = await this.server.getTransaction(result.hash);
@@ -159,51 +239,9 @@ export class SoroStreamClient {
     }
 
     if (response.status === "FAILED") {
-      throw new Error(`Transaction failed: ${result.hash}`);
+      throw new TransactionFailedError(result.hash);
     }
 
-    return result.hash;
-  }
-
-  private async buildAndSubmit(operation: xdr.Operation, signal?: AbortSignal): Promise<string> {
-    const publicKey = await this.walletAdapter.getPublicKey();
-    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
-
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: NETWORK_PASSPHRASES[this.network],
-    })
-      .addOperation(operation)
-      .setTimeout(30)
-      .build();
-
-    const preparedTx = await this.withBreaker(() => this.server.prepareTransaction(tx));
-    const signedXdr = await this.walletAdapter.signTransaction(preparedTx.toXDR(), this.network);
-
-    const result = await this.withBreaker(() =>
-      this.server.sendTransaction(
-        TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
-      )
-    );
-
-    if (result.status === "ERROR") {
-      throw new TransactionFailedError(JSON.stringify(result.errorResult));
-    }
-
-    const startTime = Date.now();
-    let delay = 500;
-    let response = await this.withBreaker(() => this.server.getTransaction(result.hash));
-    while (response.status === "NOT_FOUND") {
-      if (signal?.aborted) throw new DOMException("Transaction polling aborted", "AbortError");
-      if (Date.now() - startTime >= this.txTimeoutMs) {
-        throw new Error(`Transaction confirmation timed out after ${this.txTimeoutMs}ms`);
-      }
-      await new Promise((r) => setTimeout(r, delay));
-      delay = Math.min(delay * 2, 10_000);
-      response = await this.withBreaker(() => this.server.getTransaction(result.hash));
-    }
-
-    if (response.status === "FAILED") throw new TransactionFailedError(result.hash);
     return result.hash;
   }
 
@@ -257,6 +295,8 @@ export class SoroStreamClient {
   /**
    * Creates a new payment stream.
    * @param params - Stream creation parameters.
+   * @param signal - Optional AbortSignal to cancel transaction polling.
+   * @returns The new stream ID and transaction hash.
    * @param signal - Optional abort signal.
    * @param options - Optional write options.
    * @returns The new stream ID and transaction hash, or simulation result.
@@ -295,8 +335,8 @@ export class SoroStreamClient {
    * @returns Array of stream IDs and the transaction hash, or simulation result.
    */
   async createStreams(
-    paramsArray: CreateStreamParams[],
-    options?: { simulateOnly?: boolean }
+    paramsArray: CreateStreamsParams[],
+    options?: WriteOptions
   ): Promise<
     { streamIds: string[]; txHash: string } | SimulateOnlyResult
   > {
@@ -317,10 +357,10 @@ export class SoroStreamClient {
       return { simulated: true, result };
     }
 
-    const before = await this.getStreamsBySender(sender) as Stream[];
     const txHash = await this.buildAndSubmitBatch(operations);
-    const after = await this.getStreamsBySender(sender) as Stream[];
-    const streamIds = after.slice(before.length).map((s) => s.id);
+    const after = await this.getStreamsBySender(sender);
+    const afterStreams = Array.isArray(after) ? after : after.streams;
+    const streamIds = afterStreams.slice(-paramsArray.length).map((s) => s.id);
 
     return { streamIds, txHash };
   }
@@ -328,6 +368,8 @@ export class SoroStreamClient {
   /**
    * Withdraws all currently claimable tokens from a stream.
    * @param params - Withdraw parameters.
+   * @param signal - Optional AbortSignal to cancel transaction polling.
+   * @returns The transaction hash and withdrawn amount.
    * @param signal - Optional abort signal.
    * @param options - Optional write options.
    * @returns The transaction hash and withdrawn amount, or simulation result.
@@ -384,6 +426,8 @@ export class SoroStreamClient {
   /**
    * Cancels an active stream. Refunds unstreamed tokens to sender.
    * @param params - Cancel parameters.
+   * @param signal - Optional AbortSignal to cancel transaction polling.
+   * @returns The transaction hash.
    * @param signal - Optional abort signal.
    * @param options - Optional write options.
    * @returns The transaction hash, or simulation result.
@@ -403,6 +447,8 @@ export class SoroStreamClient {
   /**
    * Tops up an existing stream with additional tokens, extending its duration.
    * @param params - Top-up parameters.
+   * @param signal - Optional AbortSignal to cancel transaction polling.
+   * @returns The transaction hash and new end time.
    * @param signal - Optional abort signal.
    * @param options - Optional write options.
    * @returns The transaction hash and new end time, or simulation result.
@@ -453,7 +499,7 @@ export class SoroStreamClient {
       ).minResourceFee ?? 0;
 
     return {
-      totalFee: parseInt(preparedTx.fee, 10) + minResourceFee,
+      totalFee: Number(preparedTx.fee) + minResourceFee,
       minResourceFee,
     };
   }
@@ -493,6 +539,8 @@ export class SoroStreamClient {
     );
     return this.estimateOperationFee(operation);
   }
+
+  // ── Event subscription ───────────────────────────────────────────────────────
 
   private getEventPoller(): EventPoller {
     if (!this.eventPoller) {
@@ -535,10 +583,12 @@ export class SoroStreamClient {
     });
   }
 
+  // ── Read methods (with retry) ────────────────────────────────────────────────
   // ── Queries ───────────────────────────────────────────────────────────────
 
   /**
    * Returns the full stream data for a given stream ID.
+   * Automatically retries on transient RPC errors.
    * @param streamId - The stream ID to look up.
    */
   async getStream(streamId: string): Promise<Stream> {
@@ -558,9 +608,8 @@ export class SoroStreamClient {
               nativeToScVal(BigInt(streamId), { type: "u64" })
             )
           )
-          .setTimeout(30)
-          .build()
-      )
+        ),
+      this.readRetry
     );
 
     if (rpc.Api.isSimulationError(result)) {
@@ -576,9 +625,20 @@ export class SoroStreamClient {
 
   /**
    * Returns the currently claimable amount in stroops for a stream.
+   *
+   * Distinguishes "stream not found" (returns `0n`) from transient RPC errors
+   * (retried automatically, then thrown). A contract-level simulation error
+   * indicates the stream does not exist; network failures are retried.
+   *
    * @param streamId - The stream ID to check.
    */
   async getClaimable(streamId: string): Promise<bigint> {
+    const result = await withRetry(
+      () =>
+        this.simulateOp(
+          this.contract.call(
+            "get_claimable",
+            nativeToScVal(BigInt(streamId), { type: "u64" })
     const publicKey = await this.walletAdapter.getPublicKey();
     const account = await this.withBreaker(() =>
       this.server.getAccount(publicKey)
@@ -595,16 +655,14 @@ export class SoroStreamClient {
               nativeToScVal(BigInt(streamId), { type: "u64" })
             )
           )
-          .setTimeout(30)
-          .build()
-      )
+        ),
+      this.readRetry
     );
 
+    // Contract-level error = stream not found; return 0 (not a retriable error)
     if (rpc.Api.isSimulationError(result)) return 0n;
 
-    const returnVal = (
-      result as rpc.Api.SimulateTransactionSuccessResponse
-    ).result?.retval;
+    const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
     if (!returnVal) return 0n;
     return BigInt(scValToNative(returnVal) as number);
   }
@@ -612,6 +670,7 @@ export class SoroStreamClient {
   /**
    * Returns all streams created by a sender address.
    * When `pagination` is omitted, returns the full result set (backward-compatible).
+   * Automatically retries on transient RPC errors.
    *
    * @param sender - The sender address to query.
    * @param pagination - Optional limit/cursor for paginated results.
@@ -631,6 +690,9 @@ export class SoroStreamClient {
       );
     }
 
+    const result = await withRetry(
+      () => this.simulateOp(this.contract.call("get_streams_by_sender", ...args)),
+      this.readRetry
     const result = await this.withBreaker(async () =>
       this.server.simulateTransaction(
         new TransactionBuilder(
@@ -668,6 +730,7 @@ export class SoroStreamClient {
 
     if (!pagination) return streams;
 
+    const limit = pagination.limit ?? 20;
     const p = pagination;
     const limit = p.limit ?? 20;
     const last = streams[streams.length - 1];
@@ -681,6 +744,7 @@ export class SoroStreamClient {
   /**
    * Returns all streams targeting a recipient address.
    * When `pagination` is omitted, returns the full result set (backward-compatible).
+   * Automatically retries on transient RPC errors.
    *
    * @param recipient - The recipient address to query.
    * @param pagination - Optional limit/cursor for paginated results.
@@ -702,6 +766,9 @@ export class SoroStreamClient {
       );
     }
 
+    const result = await withRetry(
+      () => this.simulateOp(this.contract.call("get_streams_by_recipient", ...args)),
+      this.readRetry
     const result = await this.withBreaker(async () =>
       this.server.simulateTransaction(
         new TransactionBuilder(
@@ -741,6 +808,7 @@ export class SoroStreamClient {
 
     if (!pagination) return streams;
 
+    const limit = pagination.limit ?? 20;
     const p = pagination;
     const limit = p.limit ?? 20;
     const last = streams[streams.length - 1];
@@ -778,9 +846,9 @@ export class SoroStreamClient {
 
       const txHash = await this.buildAndSubmitBatch(operations);
 
-      const streams = await this.getStreamsBySender(sender);
-      const streamsArr = streams as Stream[];
-      const newStreams = streamsArr.slice(-chunk.length);
+      const result = await this.getStreamsBySender(sender);
+      const streams = Array.isArray(result) ? result : result.streams;
+      const newStreams = streams.slice(-chunk.length);
       const streamIds = newStreams.map((s) => s.id);
 
       results.push({ txHash, streamIds, rows: chunk });
@@ -799,3 +867,6 @@ export class SoroStreamClient {
     return this.priceFeed;
   }
 }
+
+// Re-export for convenience
+export type { StreamFilterCriteria, CreateStreamsParams };
