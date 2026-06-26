@@ -7,6 +7,26 @@ export {
   timeUntilStreamEnd,
   claimableNow,
 } from "./utils.js";
+export {
+  SoroStreamError,
+  InsufficientAmountError,
+  StreamNotFoundError,
+  StreamNotActiveError,
+  TransactionFailedError,
+} from "./errors.js";
+export { NoopLogger } from "./logger.js";
+export type { Logger } from "./logger.js";
+export { StreamIndexer } from "./indexer.js";
+export type {
+  StreamEventType,
+  StreamEvent,
+  StreamEventBase,
+  StreamCreatedData,
+  StreamWithdrawnData,
+  StreamCancelledData,
+  StreamIndexerOptions,
+  PaginatedEvents,
+} from "./indexer.js";
 export type {
   Stream,
   StreamStatus,
@@ -16,5 +36,5 @@ export type {
   TopUpParams,
   Network,
   WalletAdapter,
-  SoroStreamClientOptions,
 } from "./types.js";
+export type { SoroStreamClientOptions } from "./SoroStreamClient.js";

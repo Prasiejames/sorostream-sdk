@@ -17,6 +17,14 @@ import type {
   WalletAdapter,
   WithdrawParams,
 } from "./types.js";
+import type { Logger } from "./logger.js";
+import { NoopLogger } from "./logger.js";
+import {
+  InsufficientAmountError,
+  StreamNotFoundError,
+  StreamNotActiveError,
+  TransactionFailedError,
+} from "./errors.js";
 
 const RPC_URLS: Record<Network, string> = {
   mainnet: "https://soroban.stellar.org",
@@ -40,6 +48,8 @@ export interface SoroStreamClientOptions {
   walletAdapter: WalletAdapter;
   /** Optional custom RPC URL (overrides default). */
   rpcUrl?: string;
+  /** Optional logger for internal warnings and errors. */
+  logger?: Logger;
 }
 
 /** Maps a raw Soroban contract value to a Stream object. */
@@ -75,6 +85,7 @@ export class SoroStreamClient {
   private readonly contract: Contract;
   private readonly network: Network;
   private readonly walletAdapter: WalletAdapter;
+  private readonly logger: Logger;
 
   constructor(options: SoroStreamClientOptions) {
     this.network = options.network;
@@ -83,6 +94,7 @@ export class SoroStreamClient {
     this.server = new rpc.Server(options.rpcUrl ?? RPC_URLS[options.network], {
       allowHttp: false,
     });
+    this.logger = options.logger ?? new NoopLogger();
   }
 
   private async buildAndSubmit(operation: xdr.Operation): Promise<string> {
@@ -108,7 +120,7 @@ export class SoroStreamClient {
     );
 
     if (result.status === "ERROR") {
-      throw new Error(`Transaction failed: ${JSON.stringify(result.errorResult)}`);
+      throw new TransactionFailedError(JSON.stringify(result.errorResult));
     }
 
     // Poll for completion
@@ -119,7 +131,7 @@ export class SoroStreamClient {
     }
 
     if (response.status === "FAILED") {
-      throw new Error(`Transaction failed: ${result.hash}`);
+      throw new TransactionFailedError(result.hash);
     }
 
     return result.hash;
@@ -133,8 +145,8 @@ export class SoroStreamClient {
   async createStream(
     params: CreateStreamParams
   ): Promise<{ streamId: string; txHash: string }> {
-    if (params.amount <= 0n) throw new Error("Amount must be > 0");
-    if (params.durationSeconds <= 0) throw new Error("Duration must be > 0");
+    if (params.amount <= 0n) throw new InsufficientAmountError();
+    if (params.durationSeconds <= 0) throw new InsufficientAmountError("Duration must be > 0");
 
     const sender = await this.walletAdapter.getPublicKey();
 
@@ -153,7 +165,7 @@ export class SoroStreamClient {
     // Fetch latest stream for sender to get ID
     const streams = await this.getStreamsBySender(sender);
     const latest = streams[streams.length - 1];
-    if (!latest) throw new Error("Stream not found after creation");
+    if (!latest) throw new StreamNotFoundError("(unknown — post-creation fetch returned empty)");
 
     return { streamId: latest.id, txHash };
   }
@@ -201,7 +213,7 @@ export class SoroStreamClient {
    * @returns The transaction hash and new end time.
    */
   async topUp(params: TopUpParams): Promise<{ txHash: string; newEndTime: Date }> {
-    if (params.amount <= 0n) throw new Error("Amount must be > 0");
+    if (params.amount <= 0n) throw new InsufficientAmountError();
     const sender = await this.walletAdapter.getPublicKey();
 
     const operation = this.contract.call(
@@ -237,7 +249,7 @@ export class SoroStreamClient {
     );
 
     if (rpc.Api.isSimulationError(result)) {
-      throw new Error(`Stream not found: ${streamId}`);
+      throw new StreamNotFoundError(streamId);
     }
 
     const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
@@ -265,10 +277,16 @@ export class SoroStreamClient {
         .build()
     );
 
-    if (rpc.Api.isSimulationError(result)) return 0n;
+    if (rpc.Api.isSimulationError(result)) {
+      this.logger.warn("getClaimable simulation error for stream %s", streamId);
+      return 0n;
+    }
 
     const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) return 0n;
+    if (!returnVal) {
+      this.logger.warn("getClaimable: no return value for stream %s", streamId);
+      return 0n;
+    }
     return BigInt(scValToNative(returnVal) as number);
   }
 
@@ -292,10 +310,16 @@ export class SoroStreamClient {
         .build()
     );
 
-    if (rpc.Api.isSimulationError(result)) return [];
+    if (rpc.Api.isSimulationError(result)) {
+      this.logger.warn("getStreamsBySender simulation error for %s", sender);
+      return [];
+    }
 
     const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) return [];
+    if (!returnVal) {
+      this.logger.warn("getStreamsBySender: no return value for %s", sender);
+      return [];
+    }
 
     const raw = scValToNative(returnVal) as xdr.ScVal[];
     return raw.map(scValToStream);
@@ -321,10 +345,16 @@ export class SoroStreamClient {
         .build()
     );
 
-    if (rpc.Api.isSimulationError(result)) return [];
+    if (rpc.Api.isSimulationError(result)) {
+      this.logger.warn("getStreamsByRecipient simulation error for %s", recipient);
+      return [];
+    }
 
     const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) return [];
+    if (!returnVal) {
+      this.logger.warn("getStreamsByRecipient: no return value for %s", recipient);
+      return [];
+    }
 
     const raw = scValToNative(returnVal) as xdr.ScVal[];
     return raw.map(scValToStream);
