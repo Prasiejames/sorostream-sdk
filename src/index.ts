@@ -1,29 +1,50 @@
 export { SoroStreamClient } from "./SoroStreamClient.js";
-export { createFreighterAdapter, connectWallet } from "./wallet.js";
+export type { SoroStreamClientOptions } from "./SoroStreamClient.js";
+export { createFreighterAdapter, connectWallet, createMultisigAdapter } from "./wallet.js";
+export { WebhookForwarder } from "./webhook.js";
 export {
   toStroops,
   formatUSDC,
   calculateFlowRate,
   timeUntilStreamEnd,
   claimableNow,
+  calculateVestingSchedule,
+  watchClaimable,
+  aggregateStreamsByToken,
+  parseCsvStreamRows,
 } from "./utils.js";
-export { Cache } from "./cache.js";
-export { RateLimiter } from "./rate-limiter.js";
-export { Telemetry } from "./telemetry.js";
-export { GasProfiler } from "./profiler.js";
-export type {
-  SimulationProfile,
-  ProfileReport,
-  ProfilerConfig,
-} from "./profiler.js";
+export { templates } from "./templates.js";
+export { CircuitBreaker } from "./circuitBreaker.js";
+export type { CircuitState } from "./circuitBreaker.js";
 export type {
   Stream,
   StreamStatus,
+  StreamFilterCriteria,
   CreateStreamParams,
+  CreateStreamsParams,
   WithdrawParams,
   CancelStreamParams,
   TopUpParams,
   Network,
   WalletAdapter,
   SoroStreamClientOptions,
+  FeeEstimate,
+  VestingSchedulePoint,
+  VestingScheduleResult,
+  WatchClaimableOptions,
+  BulkStreamRow,
+  BulkCreateOptions,
+  BulkCreateBatchResult,
+  BulkCreateResult,
+  BatchWithdrawResult,
+  TokenAggregate,
+  MultisigSigner,
+  StreamEvent,
+  StreamEventType,
+  StreamEventFilter,
+  StreamSubscription,
+  PaginationParams,
+  PaginatedStreams,
+  WebhookConfig,
 } from "./types.js";
+export type { SoroStreamClientOptions } from "./SoroStreamClient.js";
