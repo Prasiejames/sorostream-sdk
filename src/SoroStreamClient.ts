@@ -94,7 +94,7 @@ export type SimulateOnlyResult = {
  * ```
  */
 export class SoroStreamClient {
-  private readonly server: rpc.Server;
+  private readonly rpcUrls: string[];
   private readonly contract: Contract;
   private readonly network: Network;
   private readonly walletAdapter: WalletAdapter;
@@ -195,13 +195,37 @@ export class SoroStreamClient {
       this.network
     );
 
-    const result = await this.server.sendTransaction(
-      TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
-    );
+  private async buildAndSubmit(operation: xdr.Operation): Promise<string> {
+    return this.withServer(async (server) => {
+      const publicKey = await this.walletAdapter.getPublicKey();
+      const account = await server.getAccount(publicKey);
 
-    if (result.status === "ERROR") {
-      throw new Error(`Transaction failed: ${JSON.stringify(result.errorResult)}`);
-    }
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASES[this.network],
+      })
+        .addOperation(operation)
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await server.prepareTransaction(tx);
+      const signedXdr = await this.walletAdapter.signTransaction(
+        preparedTx.toXDR(),
+        this.network
+      );
+
+      const result = await server.sendTransaction(
+        TransactionBuilder.fromXDR(
+          signedXdr,
+          NETWORK_PASSPHRASES[this.network]
+        )
+      );
+
+      if (result.status === "ERROR") {
+        throw new Error(
+          `Transaction failed: ${JSON.stringify(result.errorResult)}`
+        );
+      }
 
     let response = await this.server.getTransaction(result.hash);
     while (response.status === "NOT_FOUND") {
@@ -211,11 +235,12 @@ export class SoroStreamClient {
       );
     }
 
-    if (response.status === "FAILED") {
-      throw new Error(`Transaction failed: ${result.hash}`);
-    }
+      if (response.status === "FAILED") {
+        throw new Error(`Transaction failed: ${result.hash}`);
+      }
 
-    return result.hash;
+      return result.hash;
+    });
   }
 
   private async simulateOp(
@@ -624,11 +649,14 @@ export class SoroStreamClient {
       )
     );
 
-    if (rpc.Api.isSimulationError(result)) return 0n;
+      if (rpc.Api.isSimulationError(result)) return 0n;
 
-    const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) return 0n;
-    return BigInt(scValToNative(returnVal) as number);
+      const returnVal = (
+        result as rpc.Api.SimulateTransactionSuccessResponse
+      ).result?.retval;
+      if (!returnVal) return 0n;
+      return BigInt(scValToNative(returnVal) as number);
+    });
   }
 
   /**
