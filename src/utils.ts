@@ -1,13 +1,17 @@
+import { SoroStreamError } from "./errors.js";
 import type {
+  PriceFeedAdapter,
   Stream,
   BulkStreamRow,
   TokenAggregate,
   VestingScheduleResult,
   WatchClaimableOptions,
+  FormatUSDCOptions,
+  StreamDrift,
+  ReconcileStreamOptions,
   BulkStreamRow,
   TokenAggregate,
 } from "./types.js";
-import { SoroStreamError } from "./errors.js";
 
 /** A single point in a stream's payout forecast. */
 export interface PayoutSchedulePoint {
@@ -33,14 +37,85 @@ export function toStroops(amount: string, decimals: number = 7): bigint {
 
 /**
  * Formats a stroop amount to a human-readable token string (e.g. "100.5000000").
+ *
+ * When `options` is provided, the result is locale-aware (grouping separators,
+ * configurable decimal places). Without options, the existing precise
+ * fixed-decimal string is returned unchanged — safe for calculations.
+ *
  * @param stroops - Amount in the smallest token unit.
  * @param decimals - Number of decimal places the token uses (default 7 for SAC).
+ * @param options - Optional locale formatting options.
  */
-export function formatUSDC(stroops: bigint, decimals: number = 7): string {
+export function formatUSDC(
+  stroops: bigint,
+  decimals: number = 7,
+  options?: FormatUSDCOptions
+): string {
   const factor = 10n ** BigInt(decimals);
   const whole = stroops / factor;
   const remainder = stroops % factor;
-  return `${whole}.${remainder.toString().padStart(decimals, "0")}`;
+
+  if (!options) {
+    return `${whole}.${remainder.toString().padStart(decimals, "0")}`;
+  }
+
+  // Build a numeric value from the bigint parts to avoid precision loss.
+  // `whole` and `remainder` are each individually within Number.MAX_SAFE_INTEGER
+  // for any realistic token amount.
+  const numericValue = Number(whole) + Number(remainder) / Number(factor);
+
+  return new Intl.NumberFormat(options.locale, {
+    minimumFractionDigits: options.minimumFractionDigits,
+    maximumFractionDigits: options.maximumFractionDigits ?? decimals,
+    useGrouping: options.useGrouping ?? true,
+  }).format(numericValue);
+}
+
+/**
+ * Generic alias for {@link formatUSDC}. Formats a stroop amount for any token.
+ */
+export function formatToken(stroops: bigint, decimals: number = 7): string {
+  return formatUSDC(stroops, decimals);
+}
+
+/**
+ * Converts a token amount to a fiat display value using a price feed adapter.
+ *
+ * @param stroops - Amount in the smallest token unit.
+ * @param decimals - Number of decimal places the token uses.
+ * @param priceFeed - Adapter that provides token-to-fiat pricing.
+ * @param tokenAddress - The token contract address.
+ * @param displayCurrency - Target currency code (default "usd").
+ * @returns An object with both the token amount string and the fiat equivalent.
+ */
+export async function toFiatDisplay(
+  stroops: bigint,
+  decimals: number,
+  priceFeed: PriceFeedAdapter,
+  tokenAddress: string,
+  displayCurrency = "usd"
+): Promise<{ tokenAmount: string; fiatAmount: string }> {
+  const tokenAmount = formatToken(stroops, decimals);
+  const pricePerUnit = await priceFeed.getPrice(tokenAddress, displayCurrency);
+
+  const factor = 10n ** BigInt(decimals);
+  const whole = stroops / factor;
+  const remainder = stroops % factor;
+  const fractional = Number(remainder) / Number(factor);
+  const numericAmount = Number(whole) + fractional;
+  const fiatValue = numericAmount * pricePerUnit;
+
+  const fiatAmount = fiatValue.toFixed(2);
+  return { tokenAmount, fiatAmount };
+}
+
+/**
+ * Checks whether a string looks like a valid Stellar address (account or contract).
+ */
+export function isValidStellarAddress(address: string): boolean {
+  return (
+    typeof address === "string" && /^[GC][A-Z2-7]{55}$/.test(address)
+  );
 }
 
 /**
@@ -48,7 +123,10 @@ export function formatUSDC(stroops: bigint, decimals: number = 7): string {
  * @param amount - Total amount in stroops.
  * @param durationSeconds - Duration in seconds.
  */
-export function calculateFlowRate(amount: bigint, durationSeconds: number): bigint {
+export function calculateFlowRate(
+  amount: bigint,
+  durationSeconds: number
+): bigint {
   if (durationSeconds <= 0) throw new SoroStreamError("Duration must be > 0");
   return amount / BigInt(durationSeconds);
 }
@@ -102,9 +180,13 @@ export function calculateVestingSchedule(
   if (inCliff) {
     effectiveClaimable = 0n;
   } else if (currentTime >= stream.endTime) {
+    // Stream has ended — all tokens are fully vested
     effectiveClaimable = totalAmount;
   } else {
-    const elapsed = currentTime - cliffEndTime;
+    const elapsed = currentTime - Math.max(cliffEndTime, stream.startTime);
+    const elapsed =
+      Math.min(currentTime, stream.endTime) -
+      Math.max(cliffEndTime, stream.startTime);
     effectiveClaimable = stream.flowRate * BigInt(Math.max(0, elapsed));
     if (currentTime >= stream.endTime) effectiveClaimable = totalAmount;
   }
@@ -205,6 +287,102 @@ export function watchClaimable(
   };
 }
 
+// ── Issue #47: Cache reconciliation / drift detection ────────────────────────
+
+const DRIFT_FIELDS: ReadonlyArray<keyof Stream> = [
+  "status",
+  "deposit",
+  "flowRate",
+  "endTime",
+  "lastWithdrawTime",
+  "autoRenew",
+];
+
+/**
+ * Compares a cached stream against a fresh on-chain stream and returns any
+ * fields that differ. Returns an empty array when there is no drift.
+ *
+ * Only mutable fields are compared (status, deposit, flowRate, endTime,
+ * lastWithdrawTime, autoRenew). Immutable fields (id, sender, recipient,
+ * token, startTime) are excluded.
+ *
+ * @param cached - The locally cached stream state.
+ * @param onChain - The freshly fetched on-chain stream state.
+ */
+export function detectStreamDrift(cached: Stream, onChain: Stream): StreamDrift[] {
+  const diffs: StreamDrift[] = [];
+  for (const field of DRIFT_FIELDS) {
+    if (String(cached[field]) !== String(onChain[field])) {
+      diffs.push({ field, cached: cached[field], onChain: onChain[field] });
+    }
+  }
+  return diffs;
+}
+
+/**
+ * Periodically compares a cached stream against the on-chain state and invokes
+ * `onDrift` whenever a difference is detected. Useful for catching missed
+ * cache invalidations in long-running applications.
+ *
+ * Performs an immediate first check, then continues at the configured interval.
+ * The internal reference is updated on every successful fetch so that callers
+ * receive diffs relative to the most recent known state.
+ *
+ * @param stream - The initial cached stream.
+ * @param fetchOnChain - Async function that returns the current on-chain stream.
+ * @param onDrift - Called when drift is detected, with the diff list and fresh stream.
+ * @param options - Optional configuration (intervalMs, default 30 000).
+ * @returns Unsubscribe function that stops the watcher.
+ *
+ * @example
+ * ```ts
+ * const stop = watchStreamDrift(
+ *   cachedStream,
+ *   () => client.getStream(cachedStream.id),
+ *   (diffs, fresh) => console.log("Drift detected:", diffs),
+ * );
+ * // later: stop();
+ * ```
+ */
+export function watchStreamDrift(
+  stream: Stream,
+  fetchOnChain: () => Promise<Stream>,
+  onDrift: (diffs: StreamDrift[], fresh: Stream) => void,
+  options?: ReconcileStreamOptions
+): () => void {
+  const intervalMs = options?.intervalMs ?? 30_000;
+  let current = stream;
+  let stopped = false;
+
+  async function check() {
+    if (stopped) return;
+    try {
+      const fresh = await fetchOnChain();
+      if (stopped) return; // re-check after async gap in case stop() was called
+      const diffs = detectStreamDrift(current, fresh);
+      current = fresh; // always update reference to the latest known state
+      if (diffs.length > 0) {
+        onDrift(diffs, fresh);
+      }
+    } catch {
+      // swallow errors — keep watching from last known value
+    }
+  }
+
+  // Immediate first check
+  void check();
+
+  const timer = setInterval(check, intervalMs);
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
+// ── Token aggregation ─────────────────────────────────────────────────────────
+
+
 /**
  * Groups streams by token address and returns per-token aggregates.
  * Uses the client-side `claimableNow` for claimable estimates.
@@ -233,7 +411,8 @@ export function aggregateStreamsByToken(streams: Stream[]): TokenAggregate[] {
     existing.streamCount += 1;
     existing.deposited += s.deposit;
     existing.claimable += claimableNow(s);
-    existing.claimedSoFar += s.deposit - s.flowRate * BigInt(s.endTime - s.lastWithdrawTime);
+    existing.claimedSoFar +=
+      s.deposit - s.flowRate * BigInt(s.endTime - s.lastWithdrawTime);
     map.set(s.token, existing);
   }
 
@@ -261,7 +440,8 @@ export function aggregateStreamsByToken(streams: Stream[]): TokenAggregate[] {
  */
 export function parseCsvStreamRows(csv: string): BulkStreamRow[] {
   const lines = csv.trim().split(/\r?\n/);
-  if (lines.length < 2) throw new Error("CSV must have a header row and at least one data row");
+  if (lines.length < 2)
+    throw new Error("CSV must have a header row and at least one data row");
 
   const header = lines[0]!.toLowerCase().trim();
   const cols = header.split(",").map((c) => c.trim());
@@ -272,7 +452,8 @@ export function parseCsvStreamRows(csv: string): BulkStreamRow[] {
 
   if (recipientIdx === -1) throw new Error("CSV missing 'recipient' column");
   if (amountIdx === -1) throw new Error("CSV missing 'amount' column");
-  if (durationIdx === -1) throw new Error("CSV missing 'durationSeconds' column");
+  if (durationIdx === -1)
+    throw new Error("CSV missing 'durationSeconds' column");
 
   const rows: BulkStreamRow[] = [];
 
@@ -284,7 +465,7 @@ export function parseCsvStreamRows(csv: string): BulkStreamRow[] {
     const recipient = fields[recipientIdx];
     if (!recipient) throw new Error(`Row ${i + 1}: missing recipient`);
 
-    const amount = BigInt(fields[amountIdx] ?? "0");
+    const amount = BigInt(fields[amountIdx] ?? "");
     const durationSeconds = Number(fields[durationIdx] ?? "0");
 
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
@@ -296,3 +477,4 @@ export function parseCsvStreamRows(csv: string): BulkStreamRow[] {
 
   return rows;
 }
+

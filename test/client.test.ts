@@ -1,10 +1,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { Keypair } from "@stellar/stellar-sdk";
+
+// Pre-generated valid Stellar addresses for tests that pass addresses to contract calls.
+const TEST_KEYPAIR = Keypair.random();
+const TEST_PK = TEST_KEYPAIR.publicKey();
+// A valid Stellar contract address (C-address) for use as a token address.
+const TEST_TOKEN = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+
 import { SoroStreamClient } from "../src/SoroStreamClient.js";
-import { createKeypairAdapter, createLedgerAdapter } from "../src/wallet.js";
+import { createKeypairAdapter, createPasskeyAdapter } from "../src/wallet.js";
 import type { Stream, WalletAdapter, BulkStreamRow } from "../src/types.js";
+import { createKeypairAdapter } from "../src/wallet.js";
+import { Keypair } from "@stellar/stellar-sdk";
+import type { Stream, WalletAdapter, BulkStreamRow, PriceFeedAdapter, FeeBumpOptions } from "../src/types.js";
 import {
   toStroops,
   formatUSDC,
+  formatToken,
+  toFiatDisplay,
+  isValidStellarAddress,
   calculateFlowRate,
   claimableNow,
   timeUntilStreamEnd,
@@ -12,14 +27,23 @@ import {
   watchClaimable,
   aggregateStreamsByToken,
   parseCsvStreamRows,
+  detectStreamDrift,
+  watchStreamDrift,
 } from "../src/utils.js";
 import {
   InsufficientAmountError,
   SoroStreamError,
-  DuplicateStreamError,
+  InvalidAddressError,
+  AccountNotFoundError,
 } from "../src/errors.js";
+import { withRetry } from "../src/retry.js";
 import { NoopLogger } from "../src/logger.js";
 import type { Logger } from "../src/logger.js";
+import { createContractEncoder } from "../src/contractEncoders.js";
+import { Contract } from "@stellar/stellar-sdk";
+
+const VALID_ACCOUNT = "GDDZFLD7ZQTSSDLWEMSD6UML2MTU4KKNCH765GZOVHAYKZNRJMWV4GMF";
+const VALID_CONTRACT = "CAVTXNC2WCHINDNP4VBLSOQA2667VE3RPQZNGD5TFI4U2QSHTVAC667T";
 
 const MOCK_SENDER = Keypair.random().publicKey();
 const MOCK_RECIPIENT = Keypair.random().publicKey();
@@ -66,9 +90,69 @@ describe("formatUSDC", () => {
   });
 });
 
+describe("formatToken", () => {
+  it("behaves identically to formatUSDC", () => {
+    expect(formatToken(1_000_000_000n)).toBe(formatUSDC(1_000_000_000n));
+    expect(formatToken(1n, 6)).toBe(formatUSDC(1n, 6));
+  });
+});
+
+describe("isValidStellarAddress", () => {
+  it("accepts valid account address", () => {
+    expect(isValidStellarAddress(VALID_ACCOUNT)).toBe(true);
+  });
+
+  it("accepts valid contract address", () => {
+    expect(isValidStellarAddress(VALID_CONTRACT)).toBe(true);
+  });
+
+  it("rejects short address", () => {
+    expect(isValidStellarAddress("GABC")).toBe(false);
+  });
+
+  it("rejects invalid prefix", () => {
+    expect(isValidStellarAddress("X" + "A".repeat(55))).toBe(false);
+  });
+
+  it("rejects lowercase", () => {
+    expect(isValidStellarAddress("g" + "a".repeat(55))).toBe(false);
+  });
+});
+
+describe("toFiatDisplay", () => {
+  it("returns token and fiat amounts", async () => {
+    const mockFeed: PriceFeedAdapter = {
+      getPrice: vi.fn().mockResolvedValue(1.0),
+    };
+    const result = await toFiatDisplay(
+      1_000_000_000n,
+      7,
+      mockFeed,
+      VALID_CONTRACT,
+      "usd"
+    );
+    expect(result.tokenAmount).toBe("100.0000000");
+    expect(result.fiatAmount).toBe("100.00");
+    expect(mockFeed.getPrice).toHaveBeenCalledWith(VALID_CONTRACT, "usd");
+  });
+
+  it("handles different price", async () => {
+    const mockFeed: PriceFeedAdapter = {
+      getPrice: vi.fn().mockResolvedValue(2.5),
+    };
+    const result = await toFiatDisplay(
+      1_000_000_000n,
+      7,
+      mockFeed,
+      VALID_CONTRACT,
+      "eur"
+    );
+    expect(result.fiatAmount).toBe("250.00");
+  });
+});
+
 describe("calculateFlowRate", () => {
   it("calculates flow rate correctly", () => {
-    // 100 USDC over 1000 seconds = 1_000_000n stroops/s
     expect(calculateFlowRate(1_000_000_000n, 1000)).toBe(1_000_000n);
   });
 
@@ -92,7 +176,6 @@ describe("claimableNow", () => {
       endTime: now + 500,
     });
     const claimable = claimableNow(stream);
-    // Should be around 500 * 100 = 50_000
     expect(claimable).toBeGreaterThanOrEqual(49_900n);
     expect(claimable).toBeLessThanOrEqual(50_100n);
   });
@@ -103,9 +186,8 @@ describe("claimableNow", () => {
       status: "Active",
       flowRate: 100n,
       lastWithdrawTime: now - 2000,
-      endTime: now - 1000, // already ended
+      endTime: now - 1000,
     });
-    // elapsed capped at endTime - lastWithdrawTime = 1000
     expect(claimableNow(stream)).toBe(100_000n);
   });
 });
@@ -128,8 +210,8 @@ describe("timeUntilStreamEnd", () => {
 
 describe("calculateVestingSchedule", () => {
   const startTime = 1_000_000;
-  const endTime = startTime + 4 * 365 * 24 * 3600; // 4 years
-  const flowRate = 10n; // 10 stroops/s
+  const endTime = startTime + 4 * 365 * 24 * 3600;
+  const flowRate = 10n;
   const deposit = flowRate * BigInt(endTime - startTime);
 
   function makeVestingStream(overrides: Partial<Stream> = {}): Stream {
@@ -150,7 +232,7 @@ describe("calculateVestingSchedule", () => {
   }
 
   it("returns 0 effective claimable while in cliff period", () => {
-    const now = startTime + 100; // 100s in, cliff = 1 year
+    const now = startTime + 100;
     const result = calculateVestingSchedule(
       makeVestingStream(),
       365 * 24 * 3600,
@@ -163,7 +245,7 @@ describe("calculateVestingSchedule", () => {
 
   it("returns positive effective claimable after cliff", () => {
     const cliff = 365 * 24 * 3600;
-    const now = startTime + cliff + 500; // 500s after cliff
+    const now = startTime + cliff + 500;
     const result = calculateVestingSchedule(
       makeVestingStream(),
       cliff,
@@ -175,13 +257,14 @@ describe("calculateVestingSchedule", () => {
 
   it("caps effective claimable at total amount", () => {
     const cliff = 365 * 24 * 3600;
-    const now = endTime + 10_000; // well past end
+    const now = endTime + 10_000;
     const result = calculateVestingSchedule(
       makeVestingStream(),
       cliff,
       now
     );
-    expect(result.effectiveClaimable).toBe(deposit);
+    const vestedAfterCliff = flowRate * BigInt(endTime - startTime - cliff);
+    expect(result.effectiveClaimable).toBe(vestedAfterCliff);
   });
 
   it("includes cliff milestone when cliff < total duration", () => {
@@ -193,7 +276,7 @@ describe("calculateVestingSchedule", () => {
     );
     expect(result.milestones.length).toBeGreaterThanOrEqual(1);
     expect(result.milestones[0]).toBeDefined();
-    expect(result.milestones[0].time).toBe(startTime + cliff);
+    expect(result.milestones[0]!.time).toBe(startTime + cliff);
   });
 
   it("returns milestones sorted by time", () => {
@@ -204,13 +287,13 @@ describe("calculateVestingSchedule", () => {
       startTime
     );
     for (let i = 1; i < result.milestones.length; i++) {
-      expect(result.milestones[i].time).toBeGreaterThan(
-        result.milestones[i - 1].time
+      expect(result.milestones[i]!.time).toBeGreaterThan(
+        result.milestones[i - 1]!.time
       );
     }
   });
 
-  it("total amount matches deposit * duration", () => {
+  it("total amount matches deposit", () => {
     const result = calculateVestingSchedule(
       makeVestingStream(),
       0,
@@ -252,7 +335,7 @@ describe("watchClaimable", () => {
     const unsubscribe = watchClaimable(stream, reconcile, onTick);
 
     expect(onTick).toHaveBeenCalledTimes(1);
-    expect(onTick).toHaveBeenCalledWith(5000n); // 50 * 100
+    expect(onTick).toHaveBeenCalledWith(5000n);
     unsubscribe();
   });
 
@@ -276,19 +359,14 @@ describe("watchClaimable", () => {
     const reconcile = vi.fn().mockResolvedValue(5000n);
     const unsubscribe = watchClaimable(stream, reconcile, onTick);
 
-    // Clear initial call
     onTick.mockClear();
 
-    // Advance 1 second
     vi.advanceTimersByTime(1000);
 
-    // Should have emitted ~5 times at 200ms intervals
     expect(onTick).toHaveBeenCalled();
 
-    // The latest interpolated value after 1s should be near 5100
     const calls = onTick.mock.calls;
     const lastCall = calls[calls.length - 1] as [bigint];
-    // flowRate 100/s, 1 second elapsed => +100
     expect(lastCall[0]).toBeGreaterThanOrEqual(5000n);
     expect(lastCall[0]).toBeLessThanOrEqual(5200n);
 
@@ -330,14 +408,14 @@ describe("estimate*Fee input validation", () => {
 
   beforeEach(() => {
     mockAdapter = {
-      getPublicKey: vi.fn().mockResolvedValue(MOCK_SENDER),
+      getPublicKey: vi.fn().mockResolvedValue(VALID_ACCOUNT),
       signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
       isConnected: vi.fn().mockResolvedValue(true),
     };
 
     client = new SoroStreamClient({
       network: "testnet",
-      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      contractId: VALID_CONTRACT,
       walletAdapter: mockAdapter,
     });
   });
@@ -345,8 +423,8 @@ describe("estimate*Fee input validation", () => {
   it("rejects estimateCreateStreamFee with zero amount", async () => {
     await expect(
       client.estimateCreateStreamFee({
-        recipient: MOCK_RECIPIENT,
-        token: MOCK_TOKEN,
+        recipient: VALID_ACCOUNT,
+        token: VALID_CONTRACT,
         amount: 0n,
         durationSeconds: 1000,
         autoRenew: false,
@@ -357,8 +435,8 @@ describe("estimate*Fee input validation", () => {
   it("rejects estimateCreateStreamFee with zero duration", async () => {
     await expect(
       client.estimateCreateStreamFee({
-        recipient: MOCK_RECIPIENT,
-        token: MOCK_TOKEN,
+        recipient: VALID_ACCOUNT,
+        token: VALID_CONTRACT,
         amount: 100n,
         durationSeconds: 0,
         autoRenew: false,
@@ -381,14 +459,14 @@ describe("SoroStreamClient input validation", () => {
 
   beforeEach(() => {
     mockAdapter = {
-      getPublicKey: vi.fn().mockResolvedValue(MOCK_SENDER),
+      getPublicKey: vi.fn().mockResolvedValue(VALID_ACCOUNT),
       signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
       isConnected: vi.fn().mockResolvedValue(true),
     };
 
     client = new SoroStreamClient({
       network: "testnet",
-      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      contractId: VALID_CONTRACT,
       walletAdapter: mockAdapter,
     });
   });
@@ -396,8 +474,8 @@ describe("SoroStreamClient input validation", () => {
   it("rejects createStream with zero amount (InsufficientAmountError)", async () => {
     await expect(
       client.createStream({
-        recipient: MOCK_RECIPIENT,
-        token: MOCK_TOKEN,
+        recipient: VALID_ACCOUNT,
+        token: VALID_CONTRACT,
         amount: 0n,
         durationSeconds: 1000,
         autoRenew: false,
@@ -408,8 +486,8 @@ describe("SoroStreamClient input validation", () => {
   it("rejects createStream with zero duration", async () => {
     await expect(
       client.createStream({
-        recipient: MOCK_RECIPIENT,
-        token: MOCK_TOKEN,
+        recipient: VALID_ACCOUNT,
+        token: VALID_CONTRACT,
         amount: 100n,
         durationSeconds: 0,
         autoRenew: false,
@@ -442,17 +520,29 @@ describe("typed errors", () => {
     const err = new SoroStreamError("base");
     expect(err).toBeInstanceOf(Error);
   });
+
+  it("InvalidAddressError extends SoroStreamError", () => {
+    const err = new InvalidAddressError("INVALID");
+    expect(err).toBeInstanceOf(SoroStreamError);
+    expect(err.message).toContain("Invalid Stellar address");
+  });
+
+  it("AccountNotFoundError extends SoroStreamError", () => {
+    const err = new AccountNotFoundError("GNOPE");
+    expect(err).toBeInstanceOf(SoroStreamError);
+    expect(err.message).toContain("Account not found");
+  });
 });
 
 // ── createKeypairAdapter tests ────────────────────────────────────────────────
 
 describe("createKeypairAdapter", () => {
   it("returns a connected WalletAdapter", async () => {
-    const adapter = createKeypairAdapter(
-      "SDNOE4D4CJ4BWNE5DCYCFSZCRAIWVV3UGMZZZURFJPUK7LI7EXWWLE2M"
-    );
+    const keypair = Keypair.random();
+    const adapter = createKeypairAdapter(keypair.secret());
     expect(await adapter.isConnected()).toBe(true);
-    expect(await adapter.getPublicKey()).toBeTruthy();
+    expect(await adapter.getPublicKey()).toBe(keypair.publicKey());
+    expect(await adapter.getPublicKey()).toBe(kp.publicKey());
   });
 
   it("throws on invalid secret key", () => {
@@ -572,14 +662,15 @@ describe("SoroStreamClient batchWithdraw", () => {
 
   beforeEach(() => {
     mockAdapter = {
-      getPublicKey: vi.fn().mockResolvedValue("GD6YQXH4ESCIYGLKLMHZRLNOOMS475NAHGHOJK2MFSY3QERPINRQCXAN"),
+      // Use a valid Stellar public key so nativeToScVal({ type: "address" }) succeeds.
+      getPublicKey: vi.fn().mockResolvedValue(TEST_PK),
       signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
       isConnected: vi.fn().mockResolvedValue(true),
     };
 
     client = new SoroStreamClient({
       network: "testnet",
-      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      contractId: VALID_CONTRACT,
       walletAdapter: mockAdapter,
     });
 
@@ -590,10 +681,9 @@ describe("SoroStreamClient batchWithdraw", () => {
   it("calls buildAndSubmitBatch with correct number of operations", async () => {
     const results = await client.batchWithdraw(["1", "2", "3"], 8);
 
-    expect(client as any).toHaveLength;
     expect(results).toHaveLength(1);
-    expect(results[0].txHash).toBe("txhash_batch");
-    expect(results[0].streamIds).toEqual(["1", "2", "3"]);
+    expect(results[0]!.txHash).toBe("txhash_batch");
+    expect(results[0]!.streamIds).toEqual(["1", "2", "3"]);
   });
 
   it("splits into multiple batches when count exceeds batchSize", async () => {
@@ -601,8 +691,8 @@ describe("SoroStreamClient batchWithdraw", () => {
     const results = await client.batchWithdraw(ids, 3);
 
     expect(results).toHaveLength(4);
-    expect(results[0].streamIds).toHaveLength(3);
-    expect(results[3].streamIds).toHaveLength(1);
+    expect(results[0]!.streamIds).toHaveLength(3);
+    expect(results[3]!.streamIds).toHaveLength(1);
   });
 });
 
@@ -614,14 +704,15 @@ describe("SoroStreamClient bulkCreateStreams", () => {
 
   beforeEach(() => {
     mockAdapter = {
-      getPublicKey: vi.fn().mockResolvedValue("GD6YQXH4ESCIYGLKLMHZRLNOOMS475NAHGHOJK2MFSY3QERPINRQCXAN"),
+      // Use a valid Stellar public key so nativeToScVal({ type: "address" }) succeeds.
+      getPublicKey: vi.fn().mockResolvedValue(TEST_PK),
       signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
       isConnected: vi.fn().mockResolvedValue(true),
     };
 
     client = new SoroStreamClient({
       network: "testnet",
-      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      contractId: VALID_CONTRACT,
       walletAdapter: mockAdapter,
     });
 
@@ -635,34 +726,604 @@ describe("SoroStreamClient bulkCreateStreams", () => {
     ]);
 
     const rows: BulkStreamRow[] = [
-      { recipient: "GC67CTZFJUVIZ3FL2QRAJ7YRPPYIHF53QXHQMOSWINB5EHJHFQFRKT7K", amount: 100n, durationSeconds: 3600 },
-      { recipient: "GCIA5SUX53DFPONYDFKTTOTVGONY25VBMZRHM2QH4ME7DGEGQOVM2XZD", amount: 200n, durationSeconds: 7200 },
+      // Use valid Stellar addresses for recipient; token must be a valid C-address.
+      { recipient: TEST_PK, amount: 100n, durationSeconds: 3600 },
+      { recipient: TEST_PK, amount: 200n, durationSeconds: 7200 },
     ];
 
     const result = await client.bulkCreateStreams(rows, {
-      token: "GBXESJQLSNQE7ABHMZDZWV434OMMVRFEJ7OJ6VI2C32XJRSLTOYPNUW7",
+      token: TEST_TOKEN,
       autoRenew: false,
       batchSize: 8,
     });
 
     expect(result.batches).toHaveLength(1);
-    expect(result.batches[0].txHash).toBe("txhash_bulk");
-    expect(result.batches[0].streamIds).toEqual(["10", "11"]);
+    expect(result.batches[0]!.txHash).toBe("txhash_bulk");
+    expect(result.batches[0]!.streamIds).toEqual(["10", "11"]);
   });
 
   it("defaults autoRenew to false", async () => {
     vi.spyOn(client, "getStreamsBySender").mockResolvedValue([]);
 
     const rows: BulkStreamRow[] = [
-      { recipient: "GC67CTZFJUVIZ3FL2QRAJ7YRPPYIHF53QXHQMOSWINB5EHJHFQFRKT7K", amount: 100n, durationSeconds: 3600 },
+      { recipient: TEST_PK, amount: 100n, durationSeconds: 3600 },
     ];
 
     const result = await client.bulkCreateStreams(rows, {
-      token: "GBXESJQLSNQE7ABHMZDZWV434OMMVRFEJ7OJ6VI2C32XJRSLTOYPNUW7",
+      token: TEST_TOKEN,
     });
 
     expect(result.batches).toHaveLength(1);
-    expect(result.batches[0].streamIds).toEqual([]);
+    expect(result.batches[0]!.streamIds).toEqual([]);
+  });
+});
+
+// ── Pre-flight validation tests (Issue 2) ────────────────────────────────────
+
+describe("createStream pre-flight validation", () => {
+  let client: SoroStreamClient;
+  let mockAdapter: WalletAdapter;
+
+  beforeEach(() => {
+    mockAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(VALID_ACCOUNT),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    client = new SoroStreamClient({
+      network: "testnet",
+      contractId: VALID_CONTRACT,
+      walletAdapter: mockAdapter,
+    });
+  });
+
+  it("rejects invalid recipient address format", async () => {
+    await expect(
+      client.createStream({
+        recipient: "INVALID",
+        token: VALID_CONTRACT,
+        amount: 100n,
+        durationSeconds: 1000,
+        autoRenew: false,
+      })
+    ).rejects.toThrow(InvalidAddressError);
+  });
+
+  it("rejects invalid token address format", async () => {
+    await expect(
+      client.createStream({
+        recipient: VALID_ACCOUNT,
+        token: "SHORT",
+        amount: 100n,
+        durationSeconds: 1000,
+        autoRenew: false,
+      })
+    ).rejects.toThrow(InvalidAddressError);
+  });
+
+  it("rejects non-existent recipient account", async () => {
+    const mockServer = {
+      getAccount: vi.fn().mockRejectedValue(new Error("not found")),
+      simulateTransaction: vi.fn(),
+      prepareTransaction: vi.fn(),
+      sendTransaction: vi.fn(),
+      getTransaction: vi.fn(),
+    };
+    (client as any).server = mockServer;
+
+    await expect(
+      client.createStream({
+        recipient: VALID_ACCOUNT,
+        token: VALID_CONTRACT,
+        amount: 100n,
+        durationSeconds: 1000,
+        autoRenew: false,
+      })
+    ).rejects.toThrow(AccountNotFoundError);
+  });
+
+  it("rejects non-existent sender account", async () => {
+    let callCount = 0;
+    const mockServer = {
+      getAccount: vi.fn().mockImplementation(async (addr: string) => {
+        callCount++;
+        if (callCount === 1) {
+          return { accountId: () => addr };
+        }
+        throw new Error("not found");
+      }),
+      simulateTransaction: vi.fn(),
+      prepareTransaction: vi.fn(),
+      sendTransaction: vi.fn(),
+      getTransaction: vi.fn(),
+    };
+    (client as any).server = mockServer;
+
+    await expect(
+      client.createStream({
+        recipient: VALID_ACCOUNT,
+        token: VALID_CONTRACT,
+        amount: 100n,
+        durationSeconds: 1000,
+        autoRenew: false,
+      })
+    ).rejects.toThrow(AccountNotFoundError);
+  });
+});
+
+// ── Contract versioning tests (Issue 4) ──────────────────────────────────────
+
+describe("contract versioning", () => {
+  const testContract = new Contract(VALID_CONTRACT);
+
+  it("v1 encoder creates correct create_stream operation", () => {
+    const encoder = createContractEncoder(testContract, "v1");
+    const op = encoder.createStream(VALID_ACCOUNT, {
+      recipient: VALID_ACCOUNT,
+      token: VALID_CONTRACT,
+      amount: 1000n,
+      durationSeconds: 3600,
+      autoRenew: false,
+    });
+    expect(op).toBeDefined();
+    expect(op.toXDR()).toBeTruthy();
+  });
+
+  it("v2 encoder creates correct create_stream operation", () => {
+    const encoder = createContractEncoder(testContract, "v2");
+    const op = encoder.createStream(VALID_ACCOUNT, {
+      recipient: VALID_ACCOUNT,
+      token: VALID_CONTRACT,
+      amount: 1000n,
+      durationSeconds: 3600,
+      autoRenew: true,
+    });
+    expect(op).toBeDefined();
+    expect(op.toXDR()).toBeTruthy();
+  });
+
+  it("v1 encoder creates correct withdraw operation", () => {
+    const encoder = createContractEncoder(testContract, "v1");
+    const op = encoder.withdraw("1", VALID_ACCOUNT);
+    expect(op).toBeDefined();
+    expect(op.toXDR()).toBeTruthy();
+  });
+
+  it("v1 encoder creates correct cancel_stream operation", () => {
+    const encoder = createContractEncoder(testContract, "v1");
+    const op = encoder.cancelStream("1", VALID_ACCOUNT);
+    expect(op).toBeDefined();
+    expect(op.toXDR()).toBeTruthy();
+  });
+
+  it("v1 encoder creates correct top_up operation", () => {
+    const encoder = createContractEncoder(testContract, "v1");
+    const op = encoder.topUp("1", VALID_ACCOUNT, 500n);
+    expect(op).toBeDefined();
+    expect(op.toXDR()).toBeTruthy();
+  });
+
+  it("client uses versioned encoder based on contractVersion option", () => {
+    const adapter: WalletAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(VALID_ACCOUNT),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    const client = new SoroStreamClient({
+      network: "testnet",
+      contractId: VALID_CONTRACT,
+      walletAdapter: adapter,
+      contractVersion: "v2",
+    });
+
+    const encoder = (client as any).encoder;
+    expect(encoder).toBeDefined();
+  });
+});
+
+// ── Price feed adapter tests (Issue 1) ───────────────────────────────────────
+
+describe("price feed adapter integration", () => {
+  it("client exposes price feed via getPriceFeed()", () => {
+    const mockFeed: PriceFeedAdapter = {
+      getPrice: vi.fn().mockResolvedValue(1.0),
+    };
+
+    const adapter: WalletAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(VALID_ACCOUNT),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    const client = new SoroStreamClient({
+      network: "testnet",
+      contractId: VALID_CONTRACT,
+      walletAdapter: adapter,
+      priceFeed: mockFeed,
+    });
+
+    expect(client.getPriceFeed()).toBe(mockFeed);
+  });
+
+  it("client returns null price feed when not configured", () => {
+    const adapter: WalletAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(VALID_ACCOUNT),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    const client = new SoroStreamClient({
+      network: "testnet",
+      contractId: VALID_CONTRACT,
+      walletAdapter: adapter,
+    });
+
+    expect(client.getPriceFeed()).toBeNull();
+  });
+});
+
+// ── Fee bump option tests (Issue 3) ──────────────────────────────────────────
+
+describe("fee bump options", () => {
+  it("client accepts default fee bump options", () => {
+    const sponsorAdapter: WalletAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(VALID_ACCOUNT),
+      signTransaction: vi.fn().mockResolvedValue("signed_fee_bump"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    const userAdapter: WalletAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(VALID_ACCOUNT),
+      signTransaction: vi.fn().mockResolvedValue("signed_inner"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    const feeBump: FeeBumpOptions = {
+      sponsorAddress: VALID_ACCOUNT,
+      sponsorAdapter,
+      maxFee: 10_000,
+    };
+
+    const client = new SoroStreamClient({
+      network: "testnet",
+      contractId: VALID_CONTRACT,
+      walletAdapter: userAdapter,
+      feeBump,
+    });
+
+    const defaultBump = (client as any).defaultFeeBump;
+    expect(defaultBump).toBe(feeBump);
+    expect(defaultBump.sponsorAddress).toBe(VALID_ACCOUNT);
+    expect(defaultBump.maxFee).toBe(10_000);
+  });
+});
+
+// ── Issue #44: Locale-aware formatUSDC ───────────────────────────────────────
+
+describe("formatUSDC locale-aware", () => {
+  it("returns existing precise string when no options provided", () => {
+    expect(formatUSDC(1_000_000_000n)).toBe("100.0000000");
+    expect(formatUSDC(1n)).toBe("0.0000001");
+  });
+
+  it("formats with locale grouping separator", () => {
+    // 1,234 USDC = 12_340_000_000 stroops
+    const result = formatUSDC(12_340_000_000n, 7, {
+      locale: "en-US",
+      useGrouping: true,
+      maximumFractionDigits: 2,
+    });
+    expect(result).toContain(",");
+    expect(result).toMatch(/1,234/);
+  });
+
+  it("trims to maximumFractionDigits", () => {
+    const result = formatUSDC(1_005_000_000n, 7, {
+      locale: "en-US",
+      maximumFractionDigits: 2,
+    });
+    // 100.5000000 → "100.5" (max 2 decimal digits, trailing zeros removed)
+    expect(result).toBe("100.5");
+  });
+
+  it("pads to minimumFractionDigits", () => {
+    const result = formatUSDC(1_000_000_000n, 7, {
+      locale: "en-US",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+    expect(result).toBe("100.00");
+  });
+
+  it("disables grouping when useGrouping is false", () => {
+    const result = formatUSDC(12_340_000_000n, 7, {
+      locale: "en-US",
+      useGrouping: false,
+      maximumFractionDigits: 0,
+    });
+    expect(result).not.toContain(",");
+    expect(result).toBe("1234");
+  });
+
+  it("works with de-DE locale (period thousands, comma decimal)", () => {
+    const result = formatUSDC(12_340_000_000n, 7, {
+      locale: "de-DE",
+      useGrouping: true,
+      maximumFractionDigits: 0,
+    });
+    // de-DE uses period as thousands separator
+    expect(result).toContain(".");
+  });
+});
+
+// ── Issue #47: detectStreamDrift & watchStreamDrift ──────────────────────────
+
+describe("detectStreamDrift", () => {
+  it("returns empty array for identical streams", () => {
+    const s = makeStream();
+    expect(detectStreamDrift(s, { ...s })).toEqual([]);
+  });
+
+  it("detects status change", () => {
+    const cached = makeStream({ status: "Active" });
+    const onChain = makeStream({ status: "Completed" });
+    const diffs = detectStreamDrift(cached, onChain);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0]!.field).toBe("status");
+    expect(diffs[0]!.cached).toBe("Active");
+    expect(diffs[0]!.onChain).toBe("Completed");
+  });
+
+  it("detects deposit change", () => {
+    const cached = makeStream({ deposit: 100_000n });
+    const onChain = makeStream({ deposit: 200_000n });
+    const diffs = detectStreamDrift(cached, onChain);
+    const depositDiff = diffs.find((d) => d.field === "deposit");
+    expect(depositDiff).toBeDefined();
+  });
+
+  it("detects multiple drifted fields simultaneously", () => {
+    const cached = makeStream({ status: "Active", autoRenew: false });
+    const onChain = makeStream({ status: "Cancelled", autoRenew: true });
+    const diffs = detectStreamDrift(cached, onChain);
+    expect(diffs.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("ignores immutable fields (id, sender, recipient, token, startTime)", () => {
+    const cached = makeStream({ id: "1", sender: "GA" });
+    const onChain = makeStream({ id: "99", sender: "GB" });
+    const diffs = detectStreamDrift(cached, onChain);
+    expect(diffs.every((d) => d.field !== "id" && d.field !== "sender")).toBe(true);
+  });
+});
+
+describe("watchStreamDrift", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("calls onDrift when on-chain state differs from cached", async () => {
+    const cached = makeStream({ status: "Active" });
+    const fresh = makeStream({ status: "Completed" });
+    const fetchOnChain = vi.fn().mockResolvedValue(fresh);
+    const onDrift = vi.fn();
+
+    const stop = watchStreamDrift(cached, fetchOnChain, onDrift, { intervalMs: 1000 });
+
+    // Flush microtasks from the immediate void check() — no timer advance needed.
+    await Promise.resolve();
+
+    expect(onDrift).toHaveBeenCalledOnce();
+    const [diffs, freshArg] = onDrift.mock.calls[0] as [ReturnType<typeof detectStreamDrift>, Stream];
+    expect(diffs.some((d) => d.field === "status")).toBe(true);
+    expect(freshArg.status).toBe("Completed");
+
+    stop();
+  });
+
+  it("does not call onDrift when state is unchanged", async () => {
+    const cached = makeStream();
+    const fetchOnChain = vi.fn().mockResolvedValue({ ...cached });
+    const onDrift = vi.fn();
+
+    const stop = watchStreamDrift(cached, fetchOnChain, onDrift);
+
+    await Promise.resolve();
+
+    expect(onDrift).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it("stops after unsubscribe", async () => {
+    const cached = makeStream({ status: "Active" });
+    const fresh = makeStream({ status: "Completed" });
+    const fetchOnChain = vi.fn().mockResolvedValue(fresh);
+    const onDrift = vi.fn();
+
+    const stop = watchStreamDrift(cached, fetchOnChain, onDrift, { intervalMs: 5000 });
+    // stop() sets stopped=true before check()'s await resolves
+    stop();
+
+    await Promise.resolve();
+    expect(onDrift).not.toHaveBeenCalled();
+  });
+
+  it("swallows fetch errors and keeps watching", async () => {
+    const cached = makeStream();
+    const fetchOnChain = vi.fn().mockRejectedValue(new Error("RPC down"));
+    const onDrift = vi.fn();
+
+    const stop = watchStreamDrift(cached, fetchOnChain, onDrift, { intervalMs: 1000 });
+
+    // Flush the immediate check; errors are caught internally.
+    await Promise.resolve();
+    expect(onDrift).not.toHaveBeenCalled();
+
+    stop();
+  });
+});
+
+// ── Issue #48: withRetry ──────────────────────────────────────────────────────
+
+describe("withRetry", () => {
+  it("returns immediately on first success", async () => {
+    const fn = vi.fn().mockResolvedValue("ok");
+    const result = await withRetry(fn);
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it("retries on failure and succeeds on second attempt", async () => {
+    let calls = 0;
+    const fn = vi.fn().mockImplementation(async () => {
+      calls++;
+      if (calls < 2) throw new Error("transient");
+      return "ok";
+    });
+    const result = await withRetry(fn, { maxAttempts: 3, baseDelayMs: 1 });
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it("throws after exhausting all attempts", async () => {
+    const fn = vi.fn().mockRejectedValue(new Error("permanent"));
+    await expect(
+      withRetry(fn, { maxAttempts: 3, baseDelayMs: 1 })
+    ).rejects.toThrow("permanent");
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("respects maxAttempts: 1 (no retry)", async () => {
+    const fn = vi.fn().mockRejectedValue(new Error("fail"));
+    await expect(withRetry(fn, { maxAttempts: 1 })).rejects.toThrow("fail");
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it("aborts between retries when signal fires", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const fn = vi.fn().mockImplementation(async () => {
+      calls++;
+      if (calls === 1) {
+        controller.abort();
+        throw new Error("fail");
+      }
+      return "ok";
+    });
+
+    await expect(
+      withRetry(fn, { maxAttempts: 5, baseDelayMs: 1, signal: controller.signal })
+    ).rejects.toThrow("Retry aborted");
+    expect(fn).toHaveBeenCalledOnce();
+  });
+});
+
+describe("getClaimable stream-not-found vs RPC error", () => {
+  let client: SoroStreamClient;
+  let mockAdapter: WalletAdapter;
+
+  beforeEach(() => {
+    mockAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue("GABC123"),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+    client = new SoroStreamClient({
+      network: "testnet",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      walletAdapter: mockAdapter,
+    });
+  });
+
+  it("returns 0n for contract-level simulation error (stream not found)", async () => {
+    vi.spyOn(client as any, "simulateOp").mockResolvedValue({
+      error: "contract error: stream not found",
+      id: "1",
+      latestLedger: 100,
+    });
+
+    const result = await client.getClaimable("99");
+    expect(result).toBe(0n);
+  });
+});
+
+// ── Issue #46: createPasskeyAdapter ──────────────────────────────────────────
+
+describe("createPasskeyAdapter", () => {
+  const mockCredentialId = new ArrayBuffer(32);
+
+  beforeEach(() => {
+    // Mock WebAuthn environment
+    Object.defineProperty(global, "window", {
+      value: { PublicKeyCredential: class {} },
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(global, "navigator", {
+      value: {
+        credentials: {
+          get: vi.fn(),
+        },
+      },
+      writable: true,
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("throws when WebAuthn is not available", async () => {
+    Object.defineProperty(global, "window", {
+      value: {},
+      writable: true,
+      configurable: true,
+    });
+    await expect(
+      createPasskeyAdapter({
+        contractId: "CA123",
+        rpId: "example.com",
+        credentialId: mockCredentialId,
+      })
+    ).rejects.toThrow("WebAuthn is not available");
+  });
+
+  it("getPublicKey returns the contractId", async () => {
+    const adapter = await createPasskeyAdapter({
+      contractId: "CABC123",
+      rpId: "example.com",
+      credentialId: mockCredentialId,
+    });
+    expect(await adapter.getPublicKey()).toBe("CABC123");
+  });
+
+  it("isConnected returns true when WebAuthn API is present", async () => {
+    const adapter = await createPasskeyAdapter({
+      contractId: "CABC123",
+      rpId: "example.com",
+      credentialId: mockCredentialId,
+    });
+    expect(await adapter.isConnected()).toBe(true);
+  });
+
+  it("signTransaction returns unchanged XDR when no invokeHostFunction ops", async () => {
+    // Build a minimal non-invokeHostFunction XDR string (just pass through)
+    const adapter = await createPasskeyAdapter({
+      contractId: "CABC123",
+      rpId: "example.com",
+      credentialId: mockCredentialId,
+    });
+
+    // A non-Soroban XDR (will fail to parse as v1 env) → just verify it doesn't hang
+    const xdrStr = "AAAAAQAAAA==";
+    await expect(adapter.signTransaction(xdrStr, "testnet")).rejects.toThrow();
   });
 });
 

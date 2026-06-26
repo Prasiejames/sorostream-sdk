@@ -255,10 +255,22 @@ export class GasProfiler {
       }
 
       const success = result as rpc.Api.SimulateTransactionSuccessResponse;
-      const minFee = success.minResourceFee ?? "0";
-      const stateChanges = success.stateChanges ?? [];
-      const ledgerReads = stateChanges.length;
-      const ledgerWrites = 0;
+      // `cost` and `footprint` are not part of the typed interface in SDK v13;
+      // access them defensively via `any` for backwards compatibility.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const raw = success as any;
+      const cost = raw.cost ?? { cpuInsns: "0", memBytes: "0", minFee: success.minResourceFee ?? "0" };
+      const footprint = raw.footprint ?? {
+        readOnly: [] as xdr.LedgerKey[],
+        readWrite: [] as xdr.LedgerKey[],
+      };
+
+      const readOnlyKeys = footprint.readOnly ?? [];
+      const readWriteKeys = footprint.readWrite ?? [];
+
+      const ledgerReads = readOnlyKeys.length + readWriteKeys.length;
+      const ledgerWrites = readWriteKeys.length;
+      const minFee = cost.minFee ?? success.minResourceFee ?? "0";
 
       return {
         operationType,

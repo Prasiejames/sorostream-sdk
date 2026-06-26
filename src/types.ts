@@ -1,6 +1,11 @@
 /** Status of a payment stream. */
 export type StreamStatus = "Active" | "Cancelled" | "Completed";
 
+// ── Compat aliases ────────────────────────────────────────────────────────────
+export type WriteOptions = { simulateOnly?: boolean };
+export type CreateStreamsParams = CreateStreamParams;
+export type StreamFilterCriteria = StreamEventFilter;
+
 // ── Event types (#1) ─────────────────────────────────────────────────────────
 
 export type StreamEventType =
@@ -98,6 +103,9 @@ export interface CreateStreamParams {
   /** Opt-in check for duplicate stream creation. */
   checkDuplicate?: boolean;
 }
+
+/** Alias for a bulk stream creation params array. */
+export type CreateStreamsParams = CreateStreamParams[];
 
 /** Parameters for withdrawing from a stream. */
 export interface WithdrawParams {
@@ -213,6 +221,100 @@ export interface TokenAggregate {
   claimedSoFar: bigint;
 }
 
+// ── Issue #44: Locale-aware formatUSDC ───────────────────────────────────────
+
+/** Options for locale-aware {@link formatUSDC} formatting. */
+export interface FormatUSDCOptions {
+  /** BCP 47 locale string (e.g. "en-US", "de-DE"). */
+  locale?: string;
+  /** Maximum decimal digits to display. */
+  maximumFractionDigits?: number;
+  /** Minimum decimal digits to display. */
+  minimumFractionDigits?: number;
+  /** Whether to use grouping separators (e.g. commas in en-US). Default: true. */
+  useGrouping?: boolean;
+}
+
+// ── Issue #47: Cache reconciliation / drift detection ────────────────────────
+
+/** A single field that differs between cached and on-chain stream state. */
+export interface StreamDrift {
+  field: keyof Stream;
+  cached: unknown;
+  onChain: unknown;
+}
+
+/** Options for {@link watchStreamDrift}. */
+export interface ReconcileStreamOptions {
+  /** Interval in ms between on-chain reconciliation checks (default: 30000). */
+  intervalMs?: number;
+}
+
+// ── Issue #46: WebAuthn passkey adapter ─────────────────────────────────────
+
+/** Configuration for a WebAuthn/passkey-based Soroban smart wallet adapter. */
+export interface PasskeyAdapterConfig {
+  /** Deployed smart wallet contract address (becomes the wallet's public key). */
+  contractId: string;
+  /** WebAuthn relying party ID (e.g. "example.com"). */
+  rpId: string;
+  /**
+   * The credential ID of the registered passkey (ArrayBuffer from credential.rawId).
+   * Required — without it the browser may select the wrong passkey silently.
+   */
+  credentialId: ArrayBuffer;
+// ── Price feed adapter (#Issue 1) ────────────────────────────────────────────
+
+/**
+ * Pluggable adapter for converting token amounts to fiat display values.
+ * Implement this to back formatToken/toFiatDisplay with a price oracle or API.
+ */
+export interface PriceFeedAdapter {
+  /**
+   * Returns the price of one unit of the given token in the display currency.
+   * @param tokenAddress - The token contract address (e.g. SAC address).
+   * @param displayCurrency - Target currency code (default: "usd").
+   * @returns Price per token unit in the display currency.
+   */
+  getPrice(tokenAddress: string, displayCurrency?: string): Promise<number>;
+}
+
+// ── Fee bump types (#Issue 3) ────────────────────────────────────────────────
+
+/**
+ * Options for wrapping a transaction in a Stellar fee-bump.
+ * Allows an app operator to cover network fees on behalf of end users.
+ */
+export interface FeeBumpOptions {
+  /** The Stellar address of the account paying network fees. */
+  sponsorAddress: string;
+  /** Wallet adapter for signing the fee-bump envelope. */
+  sponsorAdapter: WalletAdapter;
+  /** Maximum fee in stroops the sponsor is willing to pay. */
+  maxFee?: number;
+}
+
+// ── Write options ────────────────────────────────────────────────────────────
+
+/** Options for write operations (create, withdraw, cancel, top-up). */
 export interface WriteOptions {
+  /** If true, simulate only without submitting. */
   simulateOnly?: boolean;
+  /** Override fee-bump for this specific transaction. */
+  feeBump?: FeeBumpOptions;
+}
+
+// ── Contract versioning (#Issue 4) ───────────────────────────────────────────
+
+/** Supported contract versions for call encoding. */
+export type ContractVersion = "v1" | "v2";
+
+// ── Stream filtering ────────────────────────────────────────────────────────
+
+/** Criteria for filtering streams. */
+export interface StreamFilterCriteria {
+  sender?: string;
+  recipient?: string;
+  token?: string;
+  status?: StreamStatus;
 }
