@@ -1,5 +1,7 @@
 import type {
   Stream,
+  BulkStreamRow,
+  TokenAggregate,
   VestingScheduleResult,
   WatchClaimableOptions,
   BulkStreamRow,
@@ -104,7 +106,7 @@ export function calculateVestingSchedule(
   } else {
     const elapsed = currentTime - cliffEndTime;
     effectiveClaimable = stream.flowRate * BigInt(Math.max(0, elapsed));
-    if (effectiveClaimable > totalAmount) effectiveClaimable = totalAmount;
+    if (currentTime >= stream.endTime) effectiveClaimable = totalAmount;
   }
 
   const milestones: Array<{ time: number; vested: bigint }> = [];
@@ -261,7 +263,7 @@ export function parseCsvStreamRows(csv: string): BulkStreamRow[] {
   const lines = csv.trim().split(/\r?\n/);
   if (lines.length < 2) throw new Error("CSV must have a header row and at least one data row");
 
-  const header = (lines[0] || "").toLowerCase().trim();
+  const header = lines[0]!.toLowerCase().trim();
   const cols = header.split(",").map((c) => c.trim());
 
   const recipientIdx = cols.indexOf("recipient");
@@ -275,22 +277,15 @@ export function parseCsvStreamRows(csv: string): BulkStreamRow[] {
   const rows: BulkStreamRow[] = [];
 
   for (let i = 1; i < lines.length; i++) {
-    const line = (lines[i] || "").trim();
+    const line = lines[i]!.trim();
     if (!line) continue;
     const fields = line.split(",").map((f) => f.trim());
 
     const recipient = fields[recipientIdx];
     if (!recipient) throw new Error(`Row ${i + 1}: missing recipient`);
 
-    const amountStr = fields[amountIdx];
-    const durationStr = fields[durationIdx];
-
-    if (amountStr === undefined || durationStr === undefined) {
-      throw new Error(`Row ${i + 1}: missing columns`);
-    }
-
-    const amount = BigInt(amountStr);
-    const durationSeconds = Number(durationStr);
+    const amount = BigInt(fields[amountIdx] ?? "0");
+    const durationSeconds = Number(fields[durationIdx] ?? "0");
 
     if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
       throw new Error(`Row ${i + 1}: invalid durationSeconds`);

@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Keypair, nativeToScVal } from "@stellar/stellar-sdk";
 import { SoroStreamClient } from "../src/SoroStreamClient.js";
 import { createKeypairAdapter, createLedgerAdapter } from "../src/wallet.js";
 import type { Stream, WalletAdapter, BulkStreamRow } from "../src/types.js";
@@ -450,7 +449,7 @@ describe("typed errors", () => {
 describe("createKeypairAdapter", () => {
   it("returns a connected WalletAdapter", async () => {
     const adapter = createKeypairAdapter(
-      Keypair.random().secret()
+      "SDNOE4D4CJ4BWNE5DCYCFSZCRAIWVV3UGMZZZURFJPUK7LI7EXWWLE2M"
     );
     expect(await adapter.isConnected()).toBe(true);
     expect(await adapter.getPublicKey()).toBeTruthy();
@@ -573,7 +572,7 @@ describe("SoroStreamClient batchWithdraw", () => {
 
   beforeEach(() => {
     mockAdapter = {
-      getPublicKey: vi.fn().mockResolvedValue(MOCK_SENDER),
+      getPublicKey: vi.fn().mockResolvedValue("GD6YQXH4ESCIYGLKLMHZRLNOOMS475NAHGHOJK2MFSY3QERPINRQCXAN"),
       signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
       isConnected: vi.fn().mockResolvedValue(true),
     };
@@ -615,7 +614,7 @@ describe("SoroStreamClient bulkCreateStreams", () => {
 
   beforeEach(() => {
     mockAdapter = {
-      getPublicKey: vi.fn().mockResolvedValue(MOCK_SENDER),
+      getPublicKey: vi.fn().mockResolvedValue("GD6YQXH4ESCIYGLKLMHZRLNOOMS475NAHGHOJK2MFSY3QERPINRQCXAN"),
       signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
       isConnected: vi.fn().mockResolvedValue(true),
     };
@@ -636,12 +635,12 @@ describe("SoroStreamClient bulkCreateStreams", () => {
     ]);
 
     const rows: BulkStreamRow[] = [
-      { recipient: MOCK_RECIPIENT, amount: 100n, durationSeconds: 3600 },
-      { recipient: MOCK_RECIPIENT, amount: 200n, durationSeconds: 7200 },
+      { recipient: "GC67CTZFJUVIZ3FL2QRAJ7YRPPYIHF53QXHQMOSWINB5EHJHFQFRKT7K", amount: 100n, durationSeconds: 3600 },
+      { recipient: "GCIA5SUX53DFPONYDFKTTOTVGONY25VBMZRHM2QH4ME7DGEGQOVM2XZD", amount: 200n, durationSeconds: 7200 },
     ];
 
     const result = await client.bulkCreateStreams(rows, {
-      token: MOCK_TOKEN,
+      token: "GBXESJQLSNQE7ABHMZDZWV434OMMVRFEJ7OJ6VI2C32XJRSLTOYPNUW7",
       autoRenew: false,
       batchSize: 8,
     });
@@ -655,11 +654,11 @@ describe("SoroStreamClient bulkCreateStreams", () => {
     vi.spyOn(client, "getStreamsBySender").mockResolvedValue([]);
 
     const rows: BulkStreamRow[] = [
-      { recipient: MOCK_RECIPIENT, amount: 100n, durationSeconds: 3600 },
+      { recipient: "GC67CTZFJUVIZ3FL2QRAJ7YRPPYIHF53QXHQMOSWINB5EHJHFQFRKT7K", amount: 100n, durationSeconds: 3600 },
     ];
 
     const result = await client.bulkCreateStreams(rows, {
-      token: MOCK_TOKEN,
+      token: "GBXESJQLSNQE7ABHMZDZWV434OMMVRFEJ7OJ6VI2C32XJRSLTOYPNUW7",
     });
 
     expect(result.batches).toHaveLength(1);

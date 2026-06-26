@@ -160,7 +160,7 @@ export interface WatchClaimableOptions {
   reconcileMs?: number;
 }
 
-/** Wallet adapter interface. */
+
 /** Wallet adapter interface. Implement this to support custom signing backends. */
 export interface WalletAdapter {
   getPublicKey(): Promise<string>;

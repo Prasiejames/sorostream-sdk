@@ -1,5 +1,5 @@
-import { Keypair, TransactionBuilder } from "@stellar/stellar-sdk";
 import type { WalletAdapter, Network, MultisigSigner } from "./types.js";
+import { Keypair, TransactionBuilder } from "@stellar/stellar-sdk";
 
 /**
  * Configuration for a claim-delegation adapter.

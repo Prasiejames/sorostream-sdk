@@ -26,18 +26,10 @@ import type {
   TopUpParams,
   WalletAdapter,
   WithdrawParams,
-  WriteOptions,
 } from "./types.js";
-import { CircuitBreaker, type CircuitBreakerOptions as CircuitBreakerOptionsType } from "./circuitBreaker.js";
-import { Cache } from "./cache.js";
-import { RateLimiter } from "./rate-limiter.js";
-import { Telemetry } from "./telemetry.js";
-import {
-  InsufficientAmountError,
-  StreamNotFoundError,
-  TransactionFailedError,
-  DuplicateStreamError,
-} from "./errors.js";
+import { CircuitBreaker } from "./circuitBreaker.js";
+import type { CircuitBreakerOptions } from "./circuitBreaker.js";
+import { InsufficientAmountError, TransactionFailedError, StreamNotFoundError } from "./errors.js";
 
 const RPC_URLS: Record<Network, string> = {
   mainnet: "https://soroban.stellar.org",
@@ -62,7 +54,7 @@ export interface SoroStreamClientOptions {
   /** Optional custom RPC URL (overrides default). */
   rpcUrl?: string;
   /** Optional circuit-breaker configuration for RPC calls. */
-  circuitBreaker?: CircuitBreakerOptionsType;
+  circuitBreaker?: CircuitBreakerOptions;
   /** Maximum time in ms to wait for a transaction to confirm (default: 120000). */
   txTimeoutMs?: number;
   /** Optional cache TTL in milliseconds. */
@@ -108,17 +100,12 @@ export type SimulateOnlyResult = {
  * ```
  */
 export class SoroStreamClient {
+  private readonly server: rpc.Server;
   private readonly contract: Contract;
   private readonly network: Network;
   private readonly walletAdapter: WalletAdapter;
   private readonly txTimeoutMs: number;
-  private readonly server: rpc.Server;
-  private readonly cache: Cache<string, unknown>;
-  private readonly rateLimiter: RateLimiter;
-  private readonly telemetry: Telemetry;
-  private readonly cacheTtlMs: number;
-  private readonly breaker: CircuitBreaker | null = null;
-  private readonly checkDuplicate: boolean;
+  private readonly breaker: CircuitBreaker;
   private eventPoller: EventPoller | null = null;
 
   constructor(options: SoroStreamClientOptions) {
@@ -129,149 +116,96 @@ export class SoroStreamClient {
       allowHttp: false,
     });
     this.txTimeoutMs = options.txTimeoutMs ?? 120_000;
-    this.cacheTtlMs = options.cacheTtlMs ?? 0;
-    this.cache = new Cache(this.cacheTtlMs || 60_000);
-    this.rateLimiter = new RateLimiter(options.maxConcurrentRpc ?? 10);
-    this.telemetry = new Telemetry(options.telemetry ?? false);
-    this.breaker = options.circuitBreaker ? new CircuitBreaker(options.circuitBreaker) : null;
-    this.checkDuplicate = options.checkDuplicate ?? false;
+    this.breaker = new CircuitBreaker(options.circuitBreaker);
   }
 
-  /**
-   * Clear all cached entries. Only meaningful when caching is enabled.
-   */
-  clearCache(): void {
-    this.cache.clear();
+  private withBreaker<T>(fn: () => Promise<T>): Promise<T> {
+    return this.breaker.call(fn);
   }
 
-  private cacheKey(prefix: string, id: string): string {
-    return `${prefix}:${id}`;
-  }
 
-  private async withCached<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    if (this.cacheTtlMs <= 0) return fn();
-    const cached = this.cache.get(key) as T | undefined;
-    if (cached !== undefined) return cached;
-    const result = await fn();
-    this.cache.set(key, result);
-    return result;
-  }
+  private async buildAndSubmitBatch(operations: xdr.Operation[]): Promise<string> {
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.server.getAccount(publicKey);
 
-  private async withBreaker<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.breaker) {
-      return this.breaker.call(fn);
+    let builder = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASES[this.network],
+    });
+    for (const op of operations) {
+      builder = builder.addOperation(op);
+    }
+    const tx = builder.setTimeout(30).build();
+
+    const preparedTx = await this.server.prepareTransaction(tx);
+    const signedXdr = await this.walletAdapter.signTransaction(
+      preparedTx.toXDR(),
+      this.network
+    );
+
+    const result = await this.server.sendTransaction(
+      TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+    );
+
+    if (result.status === "ERROR") {
+      throw new Error(`Transaction failed: ${JSON.stringify(result.errorResult)}`);
+    }
+
+    let response = await this.server.getTransaction(result.hash);
+    while (response.status === "NOT_FOUND") {
+      await new Promise((r) => setTimeout(r, 1000));
+      response = await this.server.getTransaction(result.hash);
     }
     return fn();
   }
 
-  private async rpcCall<T>(name: string, fn: () => Promise<T>): Promise<T> {
-    const span = this.telemetry.startSpan(`sorostream.rpc.${name}`);
-    try {
-      const result = await this.rateLimiter.run(() => this.withBreaker(fn));
-      this.telemetry.endSpan(span);
-      return result;
-    } catch (err) {
-      this.telemetry.recordError(span, err instanceof Error ? err : new Error(String(err)));
-      this.telemetry.endSpan(span);
-      throw err;
+    if (response.status === "FAILED") {
+      throw new Error(`Transaction failed: ${result.hash}`);
     }
+
+    return result.hash;
   }
 
-  /**
-   * Submits a batch of Soroban operations in a single transaction.
-   * Exposed as a lower-level primitive for custom multi-operation flows.
-   */
-  async executeBatch(
-    operations: xdr.Operation[],
-    signal?: AbortSignal
-  ): Promise<string> {
-    if (operations.length === 0) {
-      throw new Error("No operations provided for execution");
+  private async buildAndSubmit(operation: xdr.Operation, signal?: AbortSignal): Promise<string> {
+    const publicKey = await this.walletAdapter.getPublicKey();
+    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASES[this.network],
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build();
+
+    const preparedTx = await this.withBreaker(() => this.server.prepareTransaction(tx));
+    const signedXdr = await this.walletAdapter.signTransaction(preparedTx.toXDR(), this.network);
+
+    const result = await this.withBreaker(() =>
+      this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+      )
+    );
+
+    if (result.status === "ERROR") {
+      throw new TransactionFailedError(JSON.stringify(result.errorResult));
     }
 
-    const span = this.telemetry.startSpan("sorostream.executeBatch");
-    try {
-      const publicKey = await this.walletAdapter.getPublicKey();
-      const account = await this.rpcCall("getAccount", () =>
-        this.server.getAccount(publicKey)
-      );
-
-      let builder = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASES[this.network],
-      });
-
-      for (const op of operations) {
-        builder = builder.addOperation(op);
+    const startTime = Date.now();
+    let delay = 500;
+    let response = await this.withBreaker(() => this.server.getTransaction(result.hash));
+    while (response.status === "NOT_FOUND") {
+      if (signal?.aborted) throw new DOMException("Transaction polling aborted", "AbortError");
+      if (Date.now() - startTime >= this.txTimeoutMs) {
+        throw new Error(`Transaction confirmation timed out after ${this.txTimeoutMs}ms`);
       }
-
-      const tx = builder.setTimeout(30).build();
-
-      const preparedTx = await this.rpcCall("prepareTransaction", () =>
-        this.server.prepareTransaction(tx)
-      );
-
-      const signedXdr = await this.walletAdapter.signTransaction(
-        preparedTx.toXDR(),
-        this.network
-      );
-
-      const result = await this.rpcCall("sendTransaction", () =>
-        this.server.sendTransaction(
-          TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
-        )
-      );
-
-      if (result.status === "ERROR") {
-        throw new TransactionFailedError(JSON.stringify(result.errorResult));
-      }
-
-      // Poll for completion with configurable timeout and exponential backoff
-      const startTime = Date.now();
-      let delay = 500;
-      const maxDelay = 10_000;
-
-      let response = await this.rpcCall("getTransaction", () =>
-        this.server.getTransaction(result.hash)
-      );
-      while (response.status === "NOT_FOUND") {
-        if (signal?.aborted) {
-          throw new DOMException("Transaction polling aborted", "AbortError");
-        }
-
-        const elapsed = Date.now() - startTime;
-        if (elapsed >= this.txTimeoutMs) {
-          throw new Error(
-            `Transaction confirmation timed out after ${this.txTimeoutMs}ms`
-          );
-        }
-
-        await new Promise((r) => setTimeout(r, delay));
-        delay = Math.min(delay * 2, maxDelay);
-
-        response = await this.rpcCall("getTransaction", () =>
-          this.server.getTransaction(result.hash)
-        );
-      }
-
-      if (response.status === "FAILED") {
-        throw new TransactionFailedError(result.hash);
-      }
-
-      this.telemetry.endSpan(span, { "sorostream.txHash": result.hash });
-      return result.hash;
-    } catch (err) {
-      this.telemetry.recordError(span, err instanceof Error ? err : new Error(String(err)));
-      this.telemetry.endSpan(span);
-      throw err;
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 10_000);
+      response = await this.withBreaker(() => this.server.getTransaction(result.hash));
     }
-  }
 
-  private async buildAndSubmit(
-    operation: xdr.Operation,
-    signal?: AbortSignal
-  ): Promise<string> {
-    return this.executeBatch([operation], signal);
+    if (response.status === "FAILED") throw new TransactionFailedError(result.hash);
+    return result.hash;
   }
 
   private async simulateOp(
@@ -356,7 +290,7 @@ export class SoroStreamClient {
    */
   async createStreams(
     paramsArray: CreateStreamParams[],
-    options?: WriteOptions
+    options?: { simulateOnly?: boolean }
   ): Promise<
     { streamIds: string[]; txHash: string } | SimulateOnlyResult
   > {
@@ -385,10 +319,10 @@ export class SoroStreamClient {
       return { simulated: true, result };
     }
 
-    const before = (await this.getStreamsBySender(sender)) as Stream[];
-    const txHash = await this.executeBatch(operations);
-    const after = (await this.getStreamsBySender(sender)) as Stream[];
-    const streamIds = after.slice(before.length).map((s: Stream) => s.id);
+    const before = await this.getStreamsBySender(sender) as Stream[];
+    const txHash = await this.buildAndSubmitBatch(operations);
+    const after = await this.getStreamsBySender(sender) as Stream[];
+    const streamIds = after.slice(before.length).map((s) => s.id);
 
     return { streamIds, txHash };
   }
@@ -531,7 +465,7 @@ export class SoroStreamClient {
     ).minResourceFee ?? 0;
 
     return {
-      totalFee: Number(preparedTx.fee) + minResourceFee,
+      totalFee: parseInt(preparedTx.fee, 10) + minResourceFee,
       minResourceFee,
     };
   }
@@ -705,13 +639,13 @@ export class SoroStreamClient {
       )
     );
 
-      if (rpc.Api.isSimulationError(result)) return 0n;
+    if (rpc.Api.isSimulationError(result)) return 0n;
 
-      const returnVal = (
-        result as rpc.Api.SimulateTransactionSuccessResponse
-      ).result?.retval;
-      if (!returnVal) return 0n;
-      return BigInt(scValToNative(returnVal) as number);
+    const returnVal = (
+      result as rpc.Api.SimulateTransactionSuccessResponse
+    ).result?.retval;
+    if (!returnVal) return 0n;
+    return BigInt(scValToNative(returnVal) as number);
   }
 
   /**
@@ -872,9 +806,10 @@ export class SoroStreamClient {
 
       const txHash = await this.executeBatch(operations);
 
-      const streams = (await this.getStreamsBySender(sender)) as Stream[];
-      const newStreams = streams.slice(-chunk.length);
-      const streamIds = newStreams.map((s: Stream) => s.id);
+      const streams = await this.getStreamsBySender(sender);
+      const streamsArr = streams as Stream[];
+      const newStreams = streamsArr.slice(-chunk.length);
+      const streamIds = newStreams.map((s) => s.id);
 
       results.push({ txHash, streamIds, rows: chunk });
     }
