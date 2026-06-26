@@ -12,6 +12,7 @@ import type {
   CancelStreamParams,
   CreateStreamParams,
   Network,
+  RenewalForecast,
   Stream,
   TopUpParams,
   WalletAdapter,
@@ -38,8 +39,12 @@ export interface SoroStreamClientOptions {
   contractId: string;
   /** Wallet adapter for signing transactions. */
   walletAdapter: WalletAdapter;
-  /** Optional custom RPC URL (overrides default). */
-  rpcUrl?: string;
+  /**
+   * One or more RPC URLs for the Stellar Soroban RPC endpoint.
+   * If multiple URLs are provided, the client will failover to the next
+   * URL on connection failure. Defaults to the network's default RPC.
+   */
+  rpcUrl?: string | string[];
 }
 
 /** Maps a raw Soroban contract value to a Stream object. */
@@ -71,7 +76,7 @@ function scValToStream(val: xdr.ScVal): Stream {
  * ```
  */
 export class SoroStreamClient {
-  private readonly server: rpc.Server;
+  private readonly rpcUrls: string[];
   private readonly contract: Contract;
   private readonly network: Network;
   private readonly walletAdapter: WalletAdapter;
@@ -80,49 +85,76 @@ export class SoroStreamClient {
     this.network = options.network;
     this.walletAdapter = options.walletAdapter;
     this.contract = new Contract(options.contractId);
-    this.server = new rpc.Server(options.rpcUrl ?? RPC_URLS[options.network], {
-      allowHttp: false,
-    });
+    this.rpcUrls = options.rpcUrl
+      ? (Array.isArray(options.rpcUrl) ? options.rpcUrl : [options.rpcUrl])
+      : [RPC_URLS[options.network]];
+  }
+
+  /**
+   * Executes an RPC call with failover across all configured RPC URLs.
+   * On connection failure, the next URL in the list is tried automatically.
+   */
+  private async withServer<T>(
+    fn: (server: rpc.Server) => Promise<T>
+  ): Promise<T> {
+    let lastError: unknown;
+    for (const url of this.rpcUrls) {
+      const server = new rpc.Server(url, { allowHttp: false });
+      try {
+        return await fn(server);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(String(lastError));
   }
 
   private async buildAndSubmit(operation: xdr.Operation): Promise<string> {
-    const publicKey = await this.walletAdapter.getPublicKey();
-    const account = await this.server.getAccount(publicKey);
+    return this.withServer(async (server) => {
+      const publicKey = await this.walletAdapter.getPublicKey();
+      const account = await server.getAccount(publicKey);
 
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: NETWORK_PASSPHRASES[this.network],
-    })
-      .addOperation(operation)
-      .setTimeout(30)
-      .build();
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASES[this.network],
+      })
+        .addOperation(operation)
+        .setTimeout(30)
+        .build();
 
-    const preparedTx = await this.server.prepareTransaction(tx);
-    const signedXdr = await this.walletAdapter.signTransaction(
-      preparedTx.toXDR(),
-      this.network
-    );
+      const preparedTx = await server.prepareTransaction(tx);
+      const signedXdr = await this.walletAdapter.signTransaction(
+        preparedTx.toXDR(),
+        this.network
+      );
 
-    const result = await this.server.sendTransaction(
-      TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
-    );
+      const result = await server.sendTransaction(
+        TransactionBuilder.fromXDR(
+          signedXdr,
+          NETWORK_PASSPHRASES[this.network]
+        )
+      );
 
-    if (result.status === "ERROR") {
-      throw new Error(`Transaction failed: ${JSON.stringify(result.errorResult)}`);
-    }
+      if (result.status === "ERROR") {
+        throw new Error(
+          `Transaction failed: ${JSON.stringify(result.errorResult)}`
+        );
+      }
 
-    // Poll for completion
-    let response = await this.server.getTransaction(result.hash);
-    while (response.status === "NOT_FOUND") {
-      await new Promise((r) => setTimeout(r, 1000));
-      response = await this.server.getTransaction(result.hash);
-    }
+      let response = await server.getTransaction(result.hash);
+      while (response.status === "NOT_FOUND") {
+        await new Promise((r) => setTimeout(r, 1000));
+        response = await server.getTransaction(result.hash);
+      }
 
-    if (response.status === "FAILED") {
-      throw new Error(`Transaction failed: ${result.hash}`);
-    }
+      if (response.status === "FAILED") {
+        throw new Error(`Transaction failed: ${result.hash}`);
+      }
 
-    return result.hash;
+      return result.hash;
+    });
   }
 
   /**
@@ -150,7 +182,6 @@ export class SoroStreamClient {
 
     const txHash = await this.buildAndSubmit(operation);
 
-    // Fetch latest stream for sender to get ID
     const streams = await this.getStreamsBySender(sender);
     const latest = streams[streams.length - 1];
     if (!latest) throw new Error("Stream not found after creation");
@@ -163,7 +194,9 @@ export class SoroStreamClient {
    * @param params - Withdraw parameters.
    * @returns The transaction hash and withdrawn amount.
    */
-  async withdraw(params: WithdrawParams): Promise<{ txHash: string; amount: string }> {
+  async withdraw(
+    params: WithdrawParams
+  ): Promise<{ txHash: string; amount: string }> {
     const recipient = await this.walletAdapter.getPublicKey();
     const claimable = await this.getClaimable(params.streamId);
 
@@ -200,7 +233,9 @@ export class SoroStreamClient {
    * @param params - Top-up parameters.
    * @returns The transaction hash and new end time.
    */
-  async topUp(params: TopUpParams): Promise<{ txHash: string; newEndTime: Date }> {
+  async topUp(
+    params: TopUpParams
+  ): Promise<{ txHash: string; newEndTime: Date }> {
     if (params.amount <= 0n) throw new Error("Amount must be > 0");
     const sender = await this.walletAdapter.getPublicKey();
 
@@ -221,28 +256,35 @@ export class SoroStreamClient {
    * @param streamId - The stream ID to look up.
    */
   async getStream(streamId: string): Promise<Stream> {
-    const result = await this.server.simulateTransaction(
-      new TransactionBuilder(
-        await this.server.getAccount(await this.walletAdapter.getPublicKey()),
-        { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
-      )
-        .addOperation(
-          this.contract.call(
-            "get_stream",
-            nativeToScVal(BigInt(streamId), { type: "u64" })
-          )
+    return this.withServer(async (server) => {
+      const result = await server.simulateTransaction(
+        new TransactionBuilder(
+          await server.getAccount(await this.walletAdapter.getPublicKey()),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASES[this.network],
+          }
         )
-        .setTimeout(30)
-        .build()
-    );
+          .addOperation(
+            this.contract.call(
+              "get_stream",
+              nativeToScVal(BigInt(streamId), { type: "u64" })
+            )
+          )
+          .setTimeout(30)
+          .build()
+      );
 
-    if (rpc.Api.isSimulationError(result)) {
-      throw new Error(`Stream not found: ${streamId}`);
-    }
+      if (rpc.Api.isSimulationError(result)) {
+        throw new Error(`Stream not found: ${streamId}`);
+      }
 
-    const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) throw new Error("No return value from contract");
-    return scValToStream(returnVal);
+      const returnVal = (
+        result as rpc.Api.SimulateTransactionSuccessResponse
+      ).result?.retval;
+      if (!returnVal) throw new Error("No return value from contract");
+      return scValToStream(returnVal);
+    });
   }
 
   /**
@@ -250,26 +292,33 @@ export class SoroStreamClient {
    * @param streamId - The stream ID to check.
    */
   async getClaimable(streamId: string): Promise<bigint> {
-    const result = await this.server.simulateTransaction(
-      new TransactionBuilder(
-        await this.server.getAccount(await this.walletAdapter.getPublicKey()),
-        { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
-      )
-        .addOperation(
-          this.contract.call(
-            "get_claimable",
-            nativeToScVal(BigInt(streamId), { type: "u64" })
-          )
+    return this.withServer(async (server) => {
+      const result = await server.simulateTransaction(
+        new TransactionBuilder(
+          await server.getAccount(await this.walletAdapter.getPublicKey()),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASES[this.network],
+          }
         )
-        .setTimeout(30)
-        .build()
-    );
+          .addOperation(
+            this.contract.call(
+              "get_claimable",
+              nativeToScVal(BigInt(streamId), { type: "u64" })
+            )
+          )
+          .setTimeout(30)
+          .build()
+      );
 
-    if (rpc.Api.isSimulationError(result)) return 0n;
+      if (rpc.Api.isSimulationError(result)) return 0n;
 
-    const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) return 0n;
-    return BigInt(scValToNative(returnVal) as number);
+      const returnVal = (
+        result as rpc.Api.SimulateTransactionSuccessResponse
+      ).result?.retval;
+      if (!returnVal) return 0n;
+      return BigInt(scValToNative(returnVal) as number);
+    });
   }
 
   /**
@@ -277,28 +326,35 @@ export class SoroStreamClient {
    * @param sender - The sender address to query.
    */
   async getStreamsBySender(sender: string): Promise<Stream[]> {
-    const result = await this.server.simulateTransaction(
-      new TransactionBuilder(
-        await this.server.getAccount(await this.walletAdapter.getPublicKey()),
-        { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
-      )
-        .addOperation(
-          this.contract.call(
-            "get_streams_by_sender",
-            nativeToScVal(sender, { type: "address" })
-          )
+    return this.withServer(async (server) => {
+      const result = await server.simulateTransaction(
+        new TransactionBuilder(
+          await server.getAccount(await this.walletAdapter.getPublicKey()),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASES[this.network],
+          }
         )
-        .setTimeout(30)
-        .build()
-    );
+          .addOperation(
+            this.contract.call(
+              "get_streams_by_sender",
+              nativeToScVal(sender, { type: "address" })
+            )
+          )
+          .setTimeout(30)
+          .build()
+      );
 
-    if (rpc.Api.isSimulationError(result)) return [];
+      if (rpc.Api.isSimulationError(result)) return [];
 
-    const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) return [];
+      const returnVal = (
+        result as rpc.Api.SimulateTransactionSuccessResponse
+      ).result?.retval;
+      if (!returnVal) return [];
 
-    const raw = scValToNative(returnVal) as xdr.ScVal[];
-    return raw.map(scValToStream);
+      const raw = scValToNative(returnVal) as xdr.ScVal[];
+      return raw.map(scValToStream);
+    });
   }
 
   /**
@@ -306,27 +362,75 @@ export class SoroStreamClient {
    * @param recipient - The recipient address to query.
    */
   async getStreamsByRecipient(recipient: string): Promise<Stream[]> {
-    const result = await this.server.simulateTransaction(
-      new TransactionBuilder(
-        await this.server.getAccount(await this.walletAdapter.getPublicKey()),
-        { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASES[this.network] }
-      )
-        .addOperation(
-          this.contract.call(
-            "get_streams_by_recipient",
-            nativeToScVal(recipient, { type: "address" })
-          )
+    return this.withServer(async (server) => {
+      const result = await server.simulateTransaction(
+        new TransactionBuilder(
+          await server.getAccount(await this.walletAdapter.getPublicKey()),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASES[this.network],
+          }
         )
-        .setTimeout(30)
-        .build()
-    );
+          .addOperation(
+            this.contract.call(
+              "get_streams_by_recipient",
+              nativeToScVal(recipient, { type: "address" })
+            )
+          )
+          .setTimeout(30)
+          .build()
+      );
 
-    if (rpc.Api.isSimulationError(result)) return [];
+      if (rpc.Api.isSimulationError(result)) return [];
 
-    const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-    if (!returnVal) return [];
+      const returnVal = (
+        result as rpc.Api.SimulateTransactionSuccessResponse
+      ).result?.retval;
+      if (!returnVal) return [];
 
-    const raw = scValToNative(returnVal) as xdr.ScVal[];
-    return raw.map(scValToStream);
+      const raw = scValToNative(returnVal) as xdr.ScVal[];
+      return raw.map(scValToStream);
+    });
+  }
+
+  /**
+   * Computes the renewal forecast for an auto-renewing stream.
+   *
+   * Streams created with `autoRenew: true` silently restart on-chain when
+   * `withdraw` is called after `endTime` — the contract re-pulls the deposit
+   * and resets `startTime`/`endTime`. This method computes the next renewal
+   * date and amount from the current stream state so UIs can display
+   * "renews on X for Y USDC".
+   *
+   * @param streamId - The stream ID to forecast.
+   * @returns A `RenewalForecast` if the stream has `autoRenew` enabled and is
+   *   not cancelled, otherwise `null`.
+   */
+  async getRenewalForecast(streamId: string): Promise<RenewalForecast | null> {
+    const stream = await this.getStream(streamId);
+
+    if (!stream.autoRenew) return null;
+    if (stream.status === "Cancelled") return null;
+
+    const now = Math.floor(Date.now() / 1000);
+    const duration = stream.endTime - stream.startTime;
+
+    if (now < stream.endTime) {
+      // Still within the current period — renews at endTime
+      const nextStart = stream.endTime;
+      return {
+        nextRenewalDate: new Date(nextStart * 1000),
+        amount: stream.deposit,
+        nextEndTime: new Date((nextStart + duration) * 1000),
+      };
+    }
+
+    // Past end time — renewal would happen on next withdraw
+    const nextStart = now;
+    return {
+      nextRenewalDate: new Date(nextStart * 1000),
+      amount: stream.deposit,
+      nextEndTime: new Date((nextStart + duration) * 1000),
+    };
   }
 }

@@ -7,6 +7,7 @@ import {
   calculateFlowRate,
   claimableNow,
   timeUntilStreamEnd,
+  getRenewalForecast,
 } from "../src/utils.js";
 
 // ── Utility tests ────────────────────────────────────────────────────────────
@@ -90,6 +91,90 @@ describe("timeUntilStreamEnd", () => {
     const now = Math.floor(Date.now() / 1000);
     const stream = makeStream({ endTime: now + 3600 });
     expect(timeUntilStreamEnd(stream)).toBeGreaterThan(0);
+  });
+});
+
+// ── getRenewalForecast tests ───────────────────────────────────────────────────
+
+describe("getRenewalForecast", () => {
+  it("returns null for non-autoRenew stream", () => {
+    const stream = makeStream({ autoRenew: false });
+    expect(getRenewalForecast(stream)).toBeNull();
+  });
+
+  it("returns null for cancelled streams", () => {
+    const stream = makeStream({ autoRenew: true, status: "Cancelled" });
+    expect(getRenewalForecast(stream)).toBeNull();
+  });
+
+  it("forecasts renewal at endTime for active stream", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const stream = makeStream({
+      autoRenew: true,
+      startTime: now - 500,
+      endTime: now + 500,
+      deposit: 1_000_000n,
+    });
+    const forecast = getRenewalForecast(stream);
+    expect(forecast).not.toBeNull();
+    expect(forecast!.amount).toBe(1_000_000n);
+    expect(forecast!.nextRenewalDate.getTime()).toBe((now + 500) * 1000);
+    expect(forecast!.nextEndTime.getTime()).toBe((now + 500 + 1000) * 1000);
+  });
+
+  it("forecasts immediate renewal for past-endTime streams", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const stream = makeStream({
+      autoRenew: true,
+      startTime: now - 2000,
+      endTime: now - 1000,
+      deposit: 500_000n,
+    });
+    const forecast = getRenewalForecast(stream);
+    expect(forecast).not.toBeNull();
+    expect(forecast!.amount).toBe(500_000n);
+    expect(forecast!.nextRenewalDate.getTime()).toBeCloseTo(now * 1000, -2);
+    expect(forecast!.nextEndTime.getTime()).toBeCloseTo(
+      (now + 1000) * 1000,
+      -2
+    );
+  });
+});
+
+// ── Multi-RPC failover tests ─────────────────────────────────────────────────
+
+describe("SoroStreamClient RPC failover", () => {
+  it("accepts string[] for rpcUrl", () => {
+    const mockAdapter: WalletAdapter = {
+      getPublicKey: vi.fn(),
+      signTransaction: vi.fn(),
+      isConnected: vi.fn(),
+    };
+    const client = new SoroStreamClient({
+      network: "testnet",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      walletAdapter: mockAdapter,
+      rpcUrl: [
+        "https://rpc1.example.com",
+        "https://rpc2.example.com",
+      ],
+    });
+    expect(client).toBeInstanceOf(SoroStreamClient);
+  });
+
+  it("accepts single string for rpcUrl (backward compat)", () => {
+    const mockAdapter: WalletAdapter = {
+      getPublicKey: vi.fn(),
+      signTransaction: vi.fn(),
+      isConnected: vi.fn(),
+    };
+    const client = new SoroStreamClient({
+      network: "testnet",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      walletAdapter: mockAdapter,
+      rpcUrl: "https://custom.example.com",
+    });
+    expect(client).toBeInstanceOf(SoroStreamClient);
   });
 });
 

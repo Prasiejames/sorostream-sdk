@@ -70,3 +70,15 @@ export interface WalletAdapter {
   signTransaction(xdr: string, network: Network): Promise<string>;
   isConnected(): Promise<boolean>;
 }
+
+/**
+ * Forecast of the next renewal for an auto-renewing stream.
+ */
+export interface RenewalForecast {
+  /** Date when the next renewal will occur. */
+  nextRenewalDate: Date;
+  /** Amount in stroops that will be re-pulled on renewal. */
+  amount: bigint;
+  /** Date when the renewed stream period would end. */
+  nextEndTime: Date;
+}

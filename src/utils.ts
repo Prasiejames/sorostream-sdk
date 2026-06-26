@@ -1,4 +1,4 @@
-import type { Stream } from "./types.js";
+import type { RenewalForecast, Stream } from "./types.js";
 
 const STROOP_FACTOR = 10_000_000n;
 
@@ -53,4 +53,36 @@ export function claimableNow(stream: Stream): bigint {
   const effectiveNow = Math.min(now, stream.endTime);
   const elapsed = Math.max(0, effectiveNow - stream.lastWithdrawTime);
   return stream.flowRate * BigInt(elapsed);
+}
+
+/**
+ * Computes the renewal forecast for an auto-renewing stream.
+ * This is a pure utility — the client method `SoroStreamClient.getRenewalForecast`
+ * fetches the stream then defers to this function.
+ *
+ * @param stream - The stream object to forecast.
+ * @returns A `RenewalForecast` or `null` if the stream does not auto-renew.
+ */
+export function getRenewalForecast(stream: Stream): RenewalForecast | null {
+  if (!stream.autoRenew) return null;
+  if (stream.status === "Cancelled") return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  const duration = stream.endTime - stream.startTime;
+
+  if (now < stream.endTime) {
+    const nextStart = stream.endTime;
+    return {
+      nextRenewalDate: new Date(nextStart * 1000),
+      amount: stream.deposit,
+      nextEndTime: new Date((nextStart + duration) * 1000),
+    };
+  }
+
+  const nextStart = now;
+  return {
+    nextRenewalDate: new Date(nextStart * 1000),
+    amount: stream.deposit,
+    nextEndTime: new Date((nextStart + duration) * 1000),
+  };
 }

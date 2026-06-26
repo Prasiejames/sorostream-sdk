@@ -6,6 +6,7 @@ export {
   calculateFlowRate,
   timeUntilStreamEnd,
   claimableNow,
+  getRenewalForecast,
 } from "./utils.js";
 export type {
   Stream,
@@ -17,4 +18,5 @@ export type {
   Network,
   WalletAdapter,
   SoroStreamClientOptions,
+  RenewalForecast,
 } from "./types.js";
