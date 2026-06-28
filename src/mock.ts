@@ -21,15 +21,19 @@
  */
 
 import type {
+  BatchCancelResult,
   CancelStreamParams,
   CreateStreamParams,
   PaginatedStreams,
   PaginationParams,
+  SetOperatorParams,
   Stream,
   StreamEvent,
   StreamEventFilter,
   StreamSubscription,
   TopUpParams,
+  UpdateFlowRateParams,
+  OperatorTopUpParams,
   WithdrawParams,
 } from "./types.js";
 
@@ -209,6 +213,105 @@ export class MockSoroStreamClient {
       txHash: `mock-tx-topup-${params.streamId}`,
       newEndTime: new Date(newEndTime * 1000),
     };
+  }
+
+  async batchCancel(
+    streamIds: string[],
+    _batchSize = 8
+  ): Promise<BatchCancelResult[]> {
+    const results: BatchCancelResult[] = [];
+    for (const id of streamIds) {
+      const stream = this.streams.get(id);
+      if (!stream) throw new Error(`Stream not found: ${id}`);
+      if (stream.status !== "Active") throw new Error("Stream is not active");
+      this.streams.set(id, { ...stream, status: "Cancelled" });
+      this.emit({
+        type: "StreamCancelled",
+        streamId: id,
+        txHash: `mock-tx-cancel-${id}`,
+        ledger: 0,
+        timestamp: nowSec(),
+        data: {},
+      });
+    }
+    results.push({ txHash: "mock-tx-batch-cancel", streamIds });
+    return results;
+  }
+
+  async updateFlowRate(
+    params: UpdateFlowRateParams
+  ): Promise<{ txHash: string }> {
+    if (params.newFlowRate <= 0n) throw new Error("Flow rate must be > 0");
+    const stream = this.streams.get(params.streamId);
+    if (!stream) throw new Error(`Stream not found: ${params.streamId}`);
+    if (stream.status !== "Active") throw new Error("Stream is not active");
+
+    const streamedSoFar = stream.flowRate * BigInt(nowSec() - stream.startTime);
+    const remaining = stream.deposit - streamedSoFar;
+    const newEndTime = nowSec() + Number(remaining / params.newFlowRate);
+
+    this.streams.set(params.streamId, {
+      ...stream,
+      flowRate: params.newFlowRate,
+      endTime: newEndTime,
+    });
+
+    return { txHash: `mock-tx-update-fr-${params.streamId}` };
+  }
+
+  private operators = new Map<string, string[]>();
+
+  async setOperator(
+    params: SetOperatorParams
+  ): Promise<{ txHash: string }> {
+    const stream = this.streams.get(params.streamId);
+    if (!stream) throw new Error(`Stream not found: ${params.streamId}`);
+
+    const existing = this.operators.get(params.streamId) ?? [];
+    if (params.approved) {
+      if (!existing.includes(params.operator)) {
+        this.operators.set(params.streamId, [...existing, params.operator]);
+      }
+    } else {
+      this.operators.set(
+        params.streamId,
+        existing.filter((o) => o !== params.operator)
+      );
+    }
+
+    return { txHash: `mock-tx-set-op-${params.streamId}` };
+  }
+
+  async operatorCancelStream(
+    params: { streamId: string }
+  ): Promise<{ txHash: string }> {
+    const stream = this.streams.get(params.streamId);
+    if (!stream) throw new Error(`Stream not found: ${params.streamId}`);
+    const ops = this.operators.get(params.streamId) ?? [];
+    if (!ops.includes(this.senderKey)) throw new Error("Not an authorised operator");
+
+    this.streams.set(params.streamId, { ...stream, status: "Cancelled" });
+    return { txHash: `mock-tx-op-cancel-${params.streamId}` };
+  }
+
+  async operatorTopUp(
+    params: OperatorTopUpParams
+  ): Promise<{ txHash: string }> {
+    if (params.amount <= 0n) throw new Error("Amount must be > 0");
+    const stream = this.streams.get(params.streamId);
+    if (!stream) throw new Error(`Stream not found: ${params.streamId}`);
+    const ops = this.operators.get(params.streamId) ?? [];
+    if (!ops.includes(this.senderKey)) throw new Error("Not an authorised operator");
+
+    const extraSeconds = Number(params.amount / stream.flowRate);
+    const newEndTime = stream.endTime + extraSeconds;
+    this.streams.set(params.streamId, {
+      ...stream,
+      deposit: stream.deposit + params.amount,
+      endTime: newEndTime,
+    });
+
+    return { txHash: `mock-tx-op-topup-${params.streamId}` };
   }
 
   async getStream(streamId: string): Promise<Stream> {

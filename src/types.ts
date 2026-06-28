@@ -1,11 +1,6 @@
 /** Status of a payment stream. */
 export type StreamStatus = "Active" | "Cancelled" | "Completed";
 
-// ── Compat aliases ────────────────────────────────────────────────────────────
-export type WriteOptions = { simulateOnly?: boolean };
-export type CreateStreamsParams = CreateStreamParams;
-export type StreamFilterCriteria = StreamEventFilter;
-
 // ── Event types (#1) ─────────────────────────────────────────────────────────
 
 export type StreamEventType =
@@ -104,8 +99,8 @@ export interface CreateStreamParams {
   checkDuplicate?: boolean;
 }
 
-/** Alias for a bulk stream creation params array. */
-export type CreateStreamsParams = CreateStreamParams[];
+/** Alias for a single stream creation params object. */
+export type CreateStreamsParams = CreateStreamParams;
 
 /** Parameters for withdrawing from a stream. */
 export interface WithdrawParams {
@@ -136,6 +131,31 @@ export interface FeeEstimate {
   totalFee: number;
   /** Soroban resource fee in stroops. */
   minResourceFee: number;
+}
+
+/** Result of batch cancellation. */
+export interface BatchCancelResult {
+  txHash: string;
+  streamIds: string[];
+}
+
+/** Parameters for updating a stream's flow rate. */
+export interface UpdateFlowRateParams {
+  streamId: string;
+  newFlowRate: bigint;
+}
+
+/** Parameters for setting an operator on a stream. */
+export interface SetOperatorParams {
+  streamId: string;
+  operator: string;
+  approved: boolean;
+}
+
+/** Parameters for an operator to top up a stream. */
+export interface OperatorTopUpParams {
+  streamId: string;
+  amount: bigint;
 }
 
 /** A single milestone point in a vesting schedule. */
@@ -263,6 +283,8 @@ export interface PasskeyAdapterConfig {
    * Required — without it the browser may select the wrong passkey silently.
    */
   credentialId: ArrayBuffer;
+}
+
 // ── Price feed adapter (#Issue 1) ────────────────────────────────────────────
 
 /**
