@@ -19,10 +19,8 @@ import {
   InvalidAddressError,
   AccountNotFoundError,
 } from "./errors.js";
-import { CircuitBreaker } from "./circuitBreaker.js";
-import type { CircuitBreakerOptions } from "./circuitBreaker.js";
-import { withRetry } from "./retry.js";
 import type {
+  BatchCancelResult,
   BatchWithdrawResult,
   BulkCreateOptions,
   BulkCreateResult,
@@ -38,11 +36,16 @@ import type {
   StreamEventFilter,
   StreamSubscription,
   TopUpParams,
+  UpdateFlowRateParams,
+  SetOperatorParams,
+  OperatorTopUpParams,
   WalletAdapter,
   WithdrawParams,
   WriteOptions,
   StreamFilterCriteria,
   CreateStreamsParams,
+  ContractVersion,
+  FeeBumpOptions,
 } from "./types.js";
 import type { RetryOptions } from "./retry.js";
 
@@ -122,6 +125,9 @@ export class SoroStreamClient {
   private readonly walletAdapter: WalletAdapter;
   private readonly txTimeoutMs: number;
   private readonly readRetry: RetryOptions;
+  private readonly encoder: ContractCallEncoder;
+  private readonly defaultFeeBump: FeeBumpOptions | null = null;
+  private readonly priceFeed: PriceFeedAdapter | null = null;
   private eventPoller: EventPoller | null = null;
 
   constructor(options: SoroStreamClientOptions) {
@@ -137,6 +143,9 @@ export class SoroStreamClient {
       ? new CircuitBreaker(options.circuitBreaker)
       : null;
     this.readRetry = options.readRetry ?? {};
+    this.encoder = createContractEncoder(this.contract, options.contractVersion ?? "v1");
+    this.defaultFeeBump = options.feeBump ?? null;
+    this.priceFeed = options.priceFeed ?? null;
   }
 
   private async withBreaker<T>(fn: () => Promise<T>): Promise<T> {
@@ -145,7 +154,8 @@ export class SoroStreamClient {
 
   private async buildAndSubmit(
     operation: xdr.Operation,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    feeBumpOpts?: FeeBumpOptions
   ): Promise<string> {
     const publicKey = await this.walletAdapter.getPublicKey();
     const account = await this.withBreaker(() => this.server.getAccount(publicKey));
@@ -207,6 +217,9 @@ export class SoroStreamClient {
     return result.hash;
   }
 
+  private resolveFeeBump(override?: FeeBumpOptions): FeeBumpOptions | undefined {
+    return override ?? this.defaultFeeBump ?? undefined;
+  }
 
   private async buildAndSubmitBatch(operations: xdr.Operation[]): Promise<string> {
     const publicKey = await this.walletAdapter.getPublicKey();
@@ -267,7 +280,7 @@ export class SoroStreamClient {
       .addOperation(operation)
       .setTimeout(30)
       .build();
-    return this.rpcCall("simulateTransaction", () => this.server.simulateTransaction(tx));
+    return this.withBreaker(() => this.server.simulateTransaction(tx));
   }
 
   // ── Pre-flight validation (Issue 2) ───────────────────────────────────────
@@ -479,6 +492,102 @@ export class SoroStreamClient {
     return { txHash, newEndTime: new Date(stream.endTime * 1000) };
   }
 
+  /**
+   * Executes a batch of operations in a single transaction.
+   */
+  async executeBatch(operations: xdr.Operation[]): Promise<string> {
+    return this.buildAndSubmitBatch(operations);
+  }
+
+  /**
+   * Cancels multiple streams in batches.
+   */
+  async batchCancel(
+    streamIds: string[],
+    batchSize = 8
+  ): Promise<BatchCancelResult[]> {
+    const results: BatchCancelResult[] = [];
+    const sender = await this.walletAdapter.getPublicKey();
+
+    for (let i = 0; i < streamIds.length; i += batchSize) {
+      const chunk = streamIds.slice(i, i + batchSize);
+      const operations = chunk.map((id) =>
+        this.encoder.cancelStream(id, sender)
+      );
+      const txHash = await this.executeBatch(operations);
+      results.push({ txHash, streamIds: chunk });
+    }
+
+    return results;
+  }
+
+  /**
+   * Updates the flow rate on an active stream without cancelling it.
+   */
+  async updateFlowRate(
+    params: UpdateFlowRateParams,
+    signal?: AbortSignal,
+    options?: WriteOptions
+  ): Promise<{ txHash: string }> {
+    if (params.newFlowRate <= 0n) throw new InsufficientAmountError();
+    const sender = await this.walletAdapter.getPublicKey();
+    const operation = this.encoder.updateFlowRate(params.streamId, sender, params.newFlowRate);
+    const feeBump = this.resolveFeeBump(options?.feeBump);
+    const txHash = await this.buildAndSubmit(operation, signal, feeBump);
+    return { txHash };
+  }
+
+  /**
+   * Authorises or revokes an operator address for a stream.
+   */
+  async setOperator(
+    params: SetOperatorParams,
+    signal?: AbortSignal,
+    options?: WriteOptions
+  ): Promise<{ txHash: string }> {
+    const sender = await this.walletAdapter.getPublicKey();
+    const operation = this.encoder.setOperator(
+      params.streamId,
+      sender,
+      params.operator,
+      params.approved
+    );
+    const feeBump = this.resolveFeeBump(options?.feeBump);
+    const txHash = await this.buildAndSubmit(operation, signal, feeBump);
+    return { txHash };
+  }
+
+  /**
+   * Cancels a stream as an authorised operator.
+   */
+  async operatorCancelStream(
+    params: { streamId: string },
+    signal?: AbortSignal,
+    options?: WriteOptions
+  ): Promise<{ txHash: string }> {
+    const operator = await this.walletAdapter.getPublicKey();
+    const operation = this.encoder.operatorCancelStream(params.streamId, operator);
+    const feeBump = this.resolveFeeBump(options?.feeBump);
+    const txHash = await this.buildAndSubmit(operation, signal, feeBump);
+    return { txHash };
+  }
+
+  /**
+   * Tops up a stream as an authorised operator.
+   */
+  async operatorTopUp(
+    params: OperatorTopUpParams,
+    signal?: AbortSignal,
+    options?: WriteOptions
+  ): Promise<{ txHash: string }> {
+    if (params.amount <= 0n) throw new InsufficientAmountError();
+    const operator = await this.walletAdapter.getPublicKey();
+    const operation = this.encoder.operatorTopUp(params.streamId, operator, params.amount);
+    const feeBump = this.resolveFeeBump(options?.feeBump);
+    const txHash = await this.buildAndSubmit(operation, signal, feeBump);
+    return { txHash };
+  }
+
   // ── Fee estimation ────────────────────────────────────────────────────────
 
   private async estimateOperationFee(
@@ -607,8 +716,8 @@ export class SoroStreamClient {
             "get_stream",
             nativeToScVal(BigInt(streamId), { type: "u64" })
           )
-        ),
-      this.readRetry
+          .build()
+      )
     );
 
     if (rpc.Api.isSimulationError(result)) {
@@ -643,7 +752,6 @@ export class SoroStreamClient {
       this.readRetry
     );
 
-    // Contract-level error = stream not found; return 0 (not a retriable error)
     if (rpc.Api.isSimulationError(result)) return 0n;
 
     const returnVal = (result as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
