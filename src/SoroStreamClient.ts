@@ -12,6 +12,10 @@ import {
 } from "@stellar/stellar-sdk";
 import { EventPoller } from "./events.js";
 import { isValidStellarAddress } from "./utils.js";
+import { createContractEncoder } from "./contractEncoders.js";
+import type { ContractCallEncoder } from "./contractEncoders.js";
+import { CircuitBreaker } from "./circuitBreaker.js";
+import type { CircuitBreakerOptions } from "./circuitBreaker.js";
 import {
   TransactionFailedError,
   StreamNotFoundError,
@@ -47,7 +51,7 @@ import type {
   ContractVersion,
   FeeBumpOptions,
 } from "./types.js";
-import type { RetryOptions } from "./retry.js";
+import { withRetry, type RetryOptions } from "./retry.js";
 
 const RPC_URLS: Record<Network, string> = {
   mainnet: "https://soroban.stellar.org",
@@ -77,6 +81,8 @@ export interface SoroStreamClientOptions {
   txTimeoutMs?: number;
   /** Retry policy for read methods (getStream, getClaimable, etc.). */
   readRetry?: RetryOptions;
+  /** Retry policy for transaction submission RPC calls (getAccount, prepareTransaction, sendTransaction). */
+  submitRetry?: RetryOptions;
   /** Optional price-feed adapter for token-to-fiat display conversion. */
   priceFeed?: PriceFeedAdapter;
   /** Contract version to use for call encoding (default: "v1"). */
@@ -125,6 +131,7 @@ export class SoroStreamClient {
   private readonly walletAdapter: WalletAdapter;
   private readonly txTimeoutMs: number;
   private readonly readRetry: RetryOptions;
+  private readonly submitRetry: RetryOptions;
   private readonly encoder: ContractCallEncoder;
   private readonly defaultFeeBump: FeeBumpOptions | null = null;
   private readonly priceFeed: PriceFeedAdapter | null = null;
@@ -143,6 +150,7 @@ export class SoroStreamClient {
       ? new CircuitBreaker(options.circuitBreaker)
       : null;
     this.readRetry = options.readRetry ?? {};
+    this.submitRetry = options.submitRetry ?? {};
     this.encoder = createContractEncoder(this.contract, options.contractVersion ?? "v1");
     this.defaultFeeBump = options.feeBump ?? null;
     this.priceFeed = options.priceFeed ?? null;
@@ -158,7 +166,11 @@ export class SoroStreamClient {
     feeBumpOpts?: FeeBumpOptions
   ): Promise<string> {
     const publicKey = await this.walletAdapter.getPublicKey();
-    const account = await this.withBreaker(() => this.server.getAccount(publicKey));
+
+    const account = await withRetry(
+      () => this.withBreaker(() => this.server.getAccount(publicKey)),
+      { ...this.submitRetry, signal }
+    );
 
     const tx = new TransactionBuilder(account, {
       fee: BASE_FEE,
@@ -168,18 +180,23 @@ export class SoroStreamClient {
       .setTimeout(30)
       .build();
 
-    const preparedTx = await this.withBreaker(() =>
-      this.server.prepareTransaction(tx)
+    const preparedTx = await withRetry(
+      () => this.withBreaker(() => this.server.prepareTransaction(tx)),
+      { ...this.submitRetry, signal }
     );
+
     const signedXdr = await this.walletAdapter.signTransaction(
       preparedTx.toXDR(),
       this.network
     );
 
-    const result = await this.withBreaker(() =>
-      this.server.sendTransaction(
-        TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
-      )
+    const result = await withRetry(
+      () => this.withBreaker(() =>
+        this.server.sendTransaction(
+          TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+        )
+      ),
+      { ...this.submitRetry, signal }
     );
 
     if (result.status === "ERROR") {
@@ -223,7 +240,11 @@ export class SoroStreamClient {
 
   private async buildAndSubmitBatch(operations: xdr.Operation[]): Promise<string> {
     const publicKey = await this.walletAdapter.getPublicKey();
-    const account = await this.server.getAccount(publicKey);
+
+    const account = await withRetry(
+      () => this.server.getAccount(publicKey),
+      this.submitRetry
+    );
 
     let builder = new TransactionBuilder(account, {
       fee: BASE_FEE,
@@ -234,14 +255,21 @@ export class SoroStreamClient {
     }
     const tx = builder.setTimeout(30).build();
 
-    const preparedTx = await this.server.prepareTransaction(tx);
+    const preparedTx = await withRetry(
+      () => this.server.prepareTransaction(tx),
+      this.submitRetry
+    );
+
     const signedXdr = await this.walletAdapter.signTransaction(
       preparedTx.toXDR(),
       this.network
     );
 
-    const result = await this.server.sendTransaction(
-      TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+    const result = await withRetry(
+      () => this.server.sendTransaction(
+        TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASES[this.network])
+      ),
+      this.submitRetry
     );
 
     if (result.status === "ERROR") {
@@ -490,13 +518,6 @@ export class SoroStreamClient {
     const txHash = await this.buildAndSubmit(operation, signal, feeBump);
     const stream = await this.getStream(params.streamId);
     return { txHash, newEndTime: new Date(stream.endTime * 1000) };
-  }
-
-  /**
-   * Executes a batch of operations in a single transaction.
-   */
-  async executeBatch(operations: xdr.Operation[]): Promise<string> {
-    return this.buildAndSubmitBatch(operations);
   }
 
   /**
