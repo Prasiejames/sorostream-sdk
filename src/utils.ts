@@ -9,8 +9,6 @@ import type {
   FormatUSDCOptions,
   StreamDrift,
   ReconcileStreamOptions,
-  BulkStreamRow,
-  TokenAggregate,
 } from "./types.js";
 
 /** A single point in a stream's payout forecast. */
@@ -180,15 +178,14 @@ export function calculateVestingSchedule(
   if (inCliff) {
     effectiveClaimable = 0n;
   } else if (currentTime >= stream.endTime) {
-    // Stream has ended — all tokens are fully vested
-    effectiveClaimable = totalAmount;
+    effectiveClaimable = stream.flowRate * BigInt(
+      stream.endTime - Math.max(cliffEndTime, stream.startTime)
+    );
   } else {
-    const elapsed = currentTime - Math.max(cliffEndTime, stream.startTime);
     const elapsed =
       Math.min(currentTime, stream.endTime) -
       Math.max(cliffEndTime, stream.startTime);
     effectiveClaimable = stream.flowRate * BigInt(Math.max(0, elapsed));
-    if (currentTime >= stream.endTime) effectiveClaimable = totalAmount;
   }
 
   const milestones: Array<{ time: number; vested: bigint }> = [];

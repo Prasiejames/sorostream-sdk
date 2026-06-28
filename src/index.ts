@@ -31,7 +31,6 @@ export {
 export { templates } from "./templates.js";
 export { CircuitBreaker } from "./circuitBreaker.js";
 export { withRetry } from "./retry.js";
-export type { CircuitState } from "./circuitBreaker.js";
 export type { RetryOptions } from "./retry.js";
 export type { CircuitState, CircuitBreakerOptions } from "./circuitBreaker.js";
 export { createContractEncoder } from "./contractEncoders.js";
@@ -65,6 +64,7 @@ export type {
   BulkCreateOptions,
   BulkCreateBatchResult,
   BulkCreateResult,
+  BatchCancelResult,
   BatchWithdrawResult,
   TokenAggregate,
   MultisigSigner,
@@ -82,6 +82,5 @@ export type {
   PasskeyAdapterConfig,
   PriceFeedAdapter,
   FeeBumpOptions,
-  WriteOptions,
   ContractVersion,
 } from "./types.js";

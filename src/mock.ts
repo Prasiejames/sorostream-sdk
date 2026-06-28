@@ -21,6 +21,7 @@
  */
 
 import type {
+  BatchCancelResult,
   CancelStreamParams,
   CreateStreamParams,
   PaginatedStreams,
@@ -209,6 +210,29 @@ export class MockSoroStreamClient {
       txHash: `mock-tx-topup-${params.streamId}`,
       newEndTime: new Date(newEndTime * 1000),
     };
+  }
+
+  async batchCancel(
+    streamIds: string[],
+    _batchSize = 8
+  ): Promise<BatchCancelResult[]> {
+    const results: BatchCancelResult[] = [];
+    for (const id of streamIds) {
+      const stream = this.streams.get(id);
+      if (!stream) throw new Error(`Stream not found: ${id}`);
+      if (stream.status !== "Active") throw new Error("Stream is not active");
+      this.streams.set(id, { ...stream, status: "Cancelled" });
+      this.emit({
+        type: "StreamCancelled",
+        streamId: id,
+        txHash: `mock-tx-cancel-${id}`,
+        ledger: 0,
+        timestamp: nowSec(),
+        data: {},
+      });
+    }
+    results.push({ txHash: "mock-tx-batch-cancel", streamIds });
+    return results;
   }
 
   async getStream(streamId: string): Promise<Stream> {
