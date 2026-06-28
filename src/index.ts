@@ -23,6 +23,7 @@ export {
   claimableNow,
   calculateVestingSchedule,
   watchClaimable,
+  watchClaimableWs,
   aggregateStreamsByToken,
   parseCsvStreamRows,
   detectStreamDrift,

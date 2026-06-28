@@ -219,11 +219,83 @@ export function calculateVestingSchedule(
 }
 
 /**
+ * Subscribes to real-time claimable balance updates via WebSocket.
+ *
+ * Returns an unsubscribe function. Falls back to a no-op if WebSocket is
+ * unavailable or the connection fails, relying on the caller to provide
+ * a fallback mechanism.
+ *
+ * @param wsUrl - WebSocket endpoint URL.
+ * @param streamId - The stream ID to subscribe to.
+ * @param onClaimable - Callback invoked with the latest on-chain claimable value.
+ * @returns A function that closes the WS connection when called.
+ *
+ * @example
+ * ```ts
+ * const stop = watchClaimableWs("wss://rpc.example.com/ws", "42", (v) => {
+ *   console.log("On-chain claimable:", v);
+ * });
+ * // later: stop();
+ * ```
+ */
+export function watchClaimableWs(
+  wsUrl: string,
+  streamId: string,
+  onClaimable: (claimable: bigint) => void
+): () => void {
+  let ws: WebSocket | null = null;
+  let stopped = false;
+
+  try {
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      if (stopped) return;
+      ws?.send(JSON.stringify({ type: "subscribe", streamId }));
+    };
+
+    ws.onmessage = (event: MessageEvent) => {
+      if (stopped) return;
+      try {
+        const data = JSON.parse(event.data as string);
+        if (data.type === "claimable" && data.streamId === streamId) {
+          onClaimable(BigInt(data.value));
+        }
+      } catch {
+        // swallow parse errors
+      }
+    };
+
+    ws.onerror = () => {
+      // Connection failed — silently no-op; caller should provide fallback
+    };
+  } catch {
+    // WebSocket not supported in this environment
+  }
+
+  return () => {
+    stopped = true;
+    if (ws) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.close();
+      ws = null;
+    }
+  };
+}
+
+/**
  * Creates a live "counting up" ticker for the claimable balance of a stream.
  *
  * Emits smoothly interpolated claimable values on an interval, reconciled
  * periodically against the on-chain `getClaimable` value. Returns an unsubscribe
  * function to stop the ticker.
+ *
+ * When `options.wsUrl` is provided, the function also subscribes to real-time
+ * WebSocket updates from the RPC endpoint. The WS handler updates the base
+ * value used for interpolation, providing more accurate estimates between
+ * polling reconciliations. Falls back to polling-only if WS is unavailable.
  *
  * @param stream - The stream object.
  * @param reconcile - Async function that fetches the current on-chain claimable (typically `client.getClaimable(id)`).
@@ -239,6 +311,17 @@ export function calculateVestingSchedule(
  *   (claimable) => { displayElement.textContent = formatUSDC(claimable); }
  * );
  * // later: unsubscribe();
+ * ```
+ *
+ * @example
+ * ```ts
+ * // With WebSocket subscription for real-time updates
+ * const unsubscribe = watchClaimable(
+ *   stream,
+ *   () => client.getClaimable(stream.id),
+ *   (claimable) => { displayElement.textContent = formatUSDC(claimable); },
+ *   { wsUrl: "wss://rpc.example.com/ws", wsStreamId: stream.id }
+ * );
  * ```
  */
 export function watchClaimable(
@@ -277,10 +360,21 @@ export function watchClaimable(
     }
   }, reconcileMs);
 
+  // Optional WebSocket subscription for real-time on-chain updates
+  let stopWs: (() => void) | null = null;
+  if (options?.wsUrl && options?.wsStreamId) {
+    stopWs = watchClaimableWs(options.wsUrl, options.wsStreamId, (actual) => {
+      baseValue = actual;
+      baseTime = Date.now();
+      emit();
+    });
+  }
+
   return () => {
     stopped = true;
     clearInterval(tickTimer);
     clearInterval(reconcileTimer);
+    stopWs?.();
   };
 }
 

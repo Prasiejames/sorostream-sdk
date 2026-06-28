@@ -186,6 +186,17 @@ export interface WatchClaimableOptions {
   tickMs?: number;
   /** Interval in ms between on-chain reconciliations (default: 5000). */
   reconcileMs?: number;
+  /**
+   * WebSocket URL for real-time claimable updates.
+   * When provided, the watcher will subscribe via WS and fall back to
+   * polling-based interpolation if the WS connection fails.
+   */
+  wsUrl?: string;
+  /**
+   * The stream ID to subscribe to for WS updates.
+   * Required when `wsUrl` is set.
+   */
+  wsStreamId?: string;
 }
 
 
