@@ -90,4 +90,6 @@ export type {
   PriceFeedAdapter,
   FeeBumpOptions,
   ContractVersion,
+  SplitStreamParams,
+  SplitStreamResult,
 } from "./types.js";

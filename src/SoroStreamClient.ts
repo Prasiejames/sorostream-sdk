@@ -31,6 +31,8 @@ import type {
   PaginatedStreams,
   PaginationParams,
   PriceFeedAdapter,
+  SplitStreamParams,
+  SplitStreamResult,
   Stream,
   StreamEvent,
   StreamEventFilter,
@@ -586,6 +588,53 @@ export class SoroStreamClient {
     const feeBump = this.resolveFeeBump(options?.feeBump);
     const txHash = await this.buildAndSubmit(operation, signal, feeBump);
     return { txHash };
+  }
+
+  /**
+   * Splits an active stream into two streams with a user-defined ratio,
+   * cancelling the original stream.
+   *
+   * The remaining balance of the original stream is divided according to the
+   * ratio (ratioNumerator / ratioDenominator) and two new streams are created
+   * with proportional flow rates. The original stream is cancelled.
+   *
+   * @param params - Split stream parameters.
+   * @param signal - Optional AbortSignal to cancel transaction polling.
+   * @param options - Optional write options.
+   * @returns The transaction hash and the two new stream IDs.
+   */
+  async splitStream(
+    params: SplitStreamParams,
+    signal?: AbortSignal,
+    options?: WriteOptions
+  ): Promise<SplitStreamResult> {
+    if (params.ratioNumerator <= 0 || params.ratioDenominator <= 0) {
+      throw new Error("Ratio must be positive");
+    }
+    if (params.ratioNumerator >= params.ratioDenominator) {
+      throw new Error("Ratio numerator must be less than denominator");
+    }
+
+    const sender = await this.walletAdapter.getPublicKey();
+
+    if (!isValidStellarAddress(params.recipientA)) {
+      throw new InvalidAddressError(params.recipientA);
+    }
+    if (!isValidStellarAddress(params.recipientB)) {
+      throw new InvalidAddressError(params.recipientB);
+    }
+
+    const operation = this.encoder.splitStream(sender, params);
+    const feeBump = this.resolveFeeBump(options?.feeBump);
+    const txHash = await this.buildAndSubmit(operation, signal, feeBump);
+
+    const result = await this.getStreamsBySender(sender);
+    const streams = Array.isArray(result) ? result : result.streams;
+    const latest = streams.slice(-2);
+    const streamIdA = latest[0]?.id ?? "";
+    const streamIdB = latest[1]?.id ?? "";
+
+    return { txHash, streamIdA, streamIdB };
   }
 
   // ── Fee estimation ────────────────────────────────────────────────────────

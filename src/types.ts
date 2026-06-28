@@ -312,6 +312,32 @@ export interface PriceFeedAdapter {
   getPrice(tokenAddress: string, displayCurrency?: string): Promise<number>;
 }
 
+// ── Split stream types ───────────────────────────────────────────────────────
+
+/** Parameters for splitting an active stream into two streams. */
+export interface SplitStreamParams {
+  /** Stream ID to split. */
+  streamId: string;
+  /** Numerator of the split ratio (e.g. 70 for a 70/30 split). */
+  ratioNumerator: number;
+  /** Denominator of the split ratio (e.g. 100 for 70/100 = 70%). */
+  ratioDenominator: number;
+  /** First destination address for the split stream. */
+  recipientA: string;
+  /** Second destination address for the split stream. */
+  recipientB: string;
+}
+
+/** Result of splitting a stream. */
+export interface SplitStreamResult {
+  /** Transaction hash of the split operation. */
+  txHash: string;
+  /** Stream ID for the first split stream. */
+  streamIdA: string;
+  /** Stream ID for the second split stream. */
+  streamIdB: string;
+}
+
 // ── Fee bump types (#Issue 3) ────────────────────────────────────────────────
 
 /**
