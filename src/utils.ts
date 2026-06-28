@@ -9,6 +9,11 @@ import type {
   FormatUSDCOptions,
   StreamDrift,
   ReconcileStreamOptions,
+  StreamTotals,
+  StatusBreakdown,
+  DurationStats,
+  StreamHealthReport,
+  RecipientAggregate,
 } from "./types.js";
 
 /** A single point in a stream's payout forecast. */
@@ -542,6 +547,155 @@ export function aggregateStreamsByToken(streams: Stream[]): TokenAggregate[] {
     existing.claimedSoFar +=
       s.deposit - s.flowRate * BigInt(s.endTime - s.lastWithdrawTime);
     map.set(s.token, existing);
+  }
+
+  return [...map.values()].sort((a, b) => {
+    if (b.deposited > a.deposited) return 1;
+    if (b.deposited < a.deposited) return -1;
+    return 0;
+  });
+}
+
+// ── Dashboard / reporting aggregators ─────────────────────────────────────────
+
+/**
+ * Aggregates total deposited, claimable, claimed, and remaining amounts
+ * across a set of streams.
+ *
+ * @param streams - Stream list.
+ * @returns Aggregate totals.
+ *
+ * @example
+ * ```ts
+ * const totals = totalValueStreamed(streams);
+ * console.log(totals.totalDeposited, totals.totalClaimable);
+ * ```
+ */
+export function totalValueStreamed(streams: Stream[]): StreamTotals {
+  let totalDeposited = 0n;
+  let totalClaimable = 0n;
+  let totalClaimed = 0n;
+  let totalRemaining = 0n;
+
+  for (const s of streams) {
+    totalDeposited += s.deposit;
+    totalClaimable += claimableNow(s);
+    const claimed = s.deposit - s.flowRate * BigInt(s.endTime - s.lastWithdrawTime);
+    totalClaimed += claimed > 0n ? claimed : 0n;
+    totalRemaining += s.deposit - (claimed > 0n ? claimed : 0n);
+  }
+
+  return {
+    totalStreams: streams.length,
+    totalDeposited,
+    totalClaimable,
+    totalClaimed,
+    totalRemaining,
+  };
+}
+
+/**
+ * Breaks down a set of streams by their status (Active, Cancelled, Completed).
+ *
+ * @param streams - Stream list.
+ * @returns Per-status counts.
+ */
+export function aggregateStreamsByStatus(streams: Stream[]): StatusBreakdown {
+  let active = 0;
+  let cancelled = 0;
+  let completed = 0;
+
+  for (const s of streams) {
+    if (s.status === "Active") active++;
+    else if (s.status === "Cancelled") cancelled++;
+    else if (s.status === "Completed") completed++;
+  }
+
+  return { active, cancelled, completed };
+}
+
+/**
+ * Computes duration statistics (average, min, max, median) for a set of streams.
+ * Durations are calculated as `endTime - startTime` for each stream.
+ *
+ * @param streams - Stream list.
+ * @returns Duration statistics in seconds.
+ */
+export function averageStreamDuration(streams: Stream[]): DurationStats {
+  if (streams.length === 0) {
+    return { average: 0, min: 0, max: 0, median: 0 };
+  }
+
+  const durations = streams
+    .map((s) => Math.max(0, s.endTime - s.startTime))
+    .sort((a, b) => a - b);
+
+  const sum = durations.reduce((a, b) => a + b, 0);
+  const mid = Math.floor(durations.length / 2);
+
+  return {
+    average: Math.round(sum / durations.length),
+    min: durations[0]!,
+    max: durations[durations.length - 1]!,
+    median: durations.length % 2 === 0
+      ? Math.round((durations[mid - 1]! + durations[mid]!) / 2)
+      : durations[mid]!,
+  };
+}
+
+/**
+ * Generates a health report for a set of streams, counting how many are
+ * expiring, stalled, or underfunded.
+ *
+ * @param streams - Stream list.
+ * @param expiringThresholdSeconds - Seconds threshold for expiry (default 86400 = 24h).
+ * @param staleThresholdSeconds - Seconds since last withdraw for stall (default 604800 = 7d).
+ * @returns Health report.
+ */
+export function streamHealthSummary(
+  streams: Stream[],
+  expiringThresholdSeconds = 86400,
+  staleThresholdSeconds = 604800
+): StreamHealthReport {
+  let expiring = 0;
+  let stalled = 0;
+  let underfunded = 0;
+  let totalActive = 0;
+
+  for (const s of streams) {
+    if (s.status !== "Active") continue;
+    totalActive++;
+    if (isStreamExpiring(s, expiringThresholdSeconds)) expiring++;
+    if (isStreamStalled(s, staleThresholdSeconds)) stalled++;
+    if (isStreamUnderfunded(s)) underfunded++;
+  }
+
+  return { expiring, stalled, underfunded, totalActive };
+}
+
+/**
+ * Groups streams by recipient address and returns per-recipient aggregates.
+ *
+ * @param streams - Stream list.
+ * @returns Per-recipient aggregates sorted by deposited amount descending.
+ */
+export function aggregateStreamsByRecipient(streams: Stream[]): RecipientAggregate[] {
+  const map = new Map<string, RecipientAggregate>();
+
+  for (const s of streams) {
+    const existing = map.get(s.recipient) ?? {
+      recipient: s.recipient,
+      streamCount: 0,
+      deposited: 0n,
+      claimable: 0n,
+      claimedSoFar: 0n,
+    };
+    existing.streamCount += 1;
+    existing.deposited += s.deposit;
+    existing.claimable += claimableNow(s);
+    const claimed = s.deposit - s.flowRate * BigInt(s.endTime - s.lastWithdrawTime);
+    existing.claimedSoFar += claimed > 0n ? claimed : 0n;
+    map.set(s.recipient, existing);
   }
 
   return [...map.values()].sort((a, b) => {

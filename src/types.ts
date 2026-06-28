@@ -370,6 +370,70 @@ export interface WriteOptions {
 /** Supported contract versions for call encoding. */
 export type ContractVersion = "v1" | "v2";
 
+// ── Dashboard / reporting aggregate types ────────────────────────────────────
+
+/** Aggregate totals across a set of streams. */
+export interface StreamTotals {
+  /** Total number of streams. */
+  totalStreams: number;
+  /** Sum of all deposits in stroops. */
+  totalDeposited: bigint;
+  /** Sum of all claimable amounts in stroops (estimated). */
+  totalClaimable: bigint;
+  /** Sum of all claimed amounts in stroops. */
+  totalClaimed: bigint;
+  /** Sum of all remaining deposits in stroops. */
+  totalRemaining: bigint;
+}
+
+/** Per-status breakdown of a set of streams. */
+export interface StatusBreakdown {
+  /** Streams with status "Active". */
+  active: number;
+  /** Streams with status "Cancelled". */
+  cancelled: number;
+  /** Streams with status "Completed". */
+  completed: number;
+}
+
+/** Duration statistics for a set of streams. */
+export interface DurationStats {
+  /** Average duration in seconds. */
+  average: number;
+  /** Minimum duration in seconds. */
+  min: number;
+  /** Maximum duration in seconds. */
+  max: number;
+  /** Median duration in seconds. */
+  median: number;
+}
+
+/** Summary of stream health issues. */
+export interface StreamHealthReport {
+  /** Number of active streams expiring within the threshold. */
+  expiring: number;
+  /** Number of active streams that have stalled. */
+  stalled: number;
+  /** Number of active streams that are underfunded. */
+  underfunded: number;
+  /** Total active streams checked. */
+  totalActive: number;
+}
+
+/** Per-recipient aggregate of a set of streams. */
+export interface RecipientAggregate {
+  /** Recipient address. */
+  recipient: string;
+  /** Number of streams targeting this recipient. */
+  streamCount: number;
+  /** Total deposited in stroops. */
+  deposited: bigint;
+  /** Estimated claimable amount in stroops. */
+  claimable: bigint;
+  /** Total claimed so far in stroops. */
+  claimedSoFar: bigint;
+}
+
 // ── Stream filtering ────────────────────────────────────────────────────────
 
 /** Criteria for filtering streams. */
