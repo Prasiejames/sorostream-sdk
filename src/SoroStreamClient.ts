@@ -42,6 +42,8 @@ import type {
   StreamSubscription,
   TopUpParams,
   UpdateFlowRateParams,
+  SetOperatorParams,
+  OperatorTopUpParams,
   WalletAdapter,
   WithdrawParams,
   WriteOptions,
@@ -530,6 +532,57 @@ export class SoroStreamClient {
     if (params.newFlowRate <= 0n) throw new InsufficientAmountError();
     const sender = await this.walletAdapter.getPublicKey();
     const operation = this.encoder.updateFlowRate(params.streamId, sender, params.newFlowRate);
+    const feeBump = this.resolveFeeBump(options?.feeBump);
+    const txHash = await this.buildAndSubmit(operation, signal, feeBump);
+    return { txHash };
+  }
+
+  /**
+   * Authorises or revokes an operator address for a stream.
+   */
+  async setOperator(
+    params: SetOperatorParams,
+    signal?: AbortSignal,
+    options?: WriteOptions
+  ): Promise<{ txHash: string }> {
+    const sender = await this.walletAdapter.getPublicKey();
+    const operation = this.encoder.setOperator(
+      params.streamId,
+      sender,
+      params.operator,
+      params.approved
+    );
+    const feeBump = this.resolveFeeBump(options?.feeBump);
+    const txHash = await this.buildAndSubmit(operation, signal, feeBump);
+    return { txHash };
+  }
+
+  /**
+   * Cancels a stream as an authorised operator.
+   */
+  async operatorCancelStream(
+    params: { streamId: string },
+    signal?: AbortSignal,
+    options?: WriteOptions
+  ): Promise<{ txHash: string }> {
+    const operator = await this.walletAdapter.getPublicKey();
+    const operation = this.encoder.operatorCancelStream(params.streamId, operator);
+    const feeBump = this.resolveFeeBump(options?.feeBump);
+    const txHash = await this.buildAndSubmit(operation, signal, feeBump);
+    return { txHash };
+  }
+
+  /**
+   * Tops up a stream as an authorised operator.
+   */
+  async operatorTopUp(
+    params: OperatorTopUpParams,
+    signal?: AbortSignal,
+    options?: WriteOptions
+  ): Promise<{ txHash: string }> {
+    if (params.amount <= 0n) throw new InsufficientAmountError();
+    const operator = await this.walletAdapter.getPublicKey();
+    const operation = this.encoder.operatorTopUp(params.streamId, operator, params.amount);
     const feeBump = this.resolveFeeBump(options?.feeBump);
     const txHash = await this.buildAndSubmit(operation, signal, feeBump);
     return { txHash };

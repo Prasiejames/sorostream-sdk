@@ -1257,6 +1257,105 @@ describe("isStreamUnderfunded", () => {
   });
 });
 
+// ── Operator delegation tests ────────────────────────────────────────────────
+
+describe("SoroStreamClient setOperator", () => {
+  let client: SoroStreamClient;
+  let mockAdapter: WalletAdapter;
+
+  beforeEach(() => {
+    mockAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(TEST_PK),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    client = new SoroStreamClient({
+      network: "testnet",
+      contractId: VALID_CONTRACT,
+      walletAdapter: mockAdapter,
+    });
+
+    vi.spyOn(client, "buildAndSubmit" as any).mockResolvedValue("txhash_op");
+  });
+
+  it("sets an operator and returns tx hash", async () => {
+    const result = await client.setOperator({
+      streamId: "1",
+      operator: TEST_PK,
+      approved: true,
+    });
+    expect(result.txHash).toBe("txhash_op");
+  });
+
+  it("revokes an operator when approved is false", async () => {
+    const result = await client.setOperator({
+      streamId: "1",
+      operator: TEST_PK,
+      approved: false,
+    });
+    expect(result.txHash).toBe("txhash_op");
+  });
+});
+
+describe("SoroStreamClient operatorCancelStream", () => {
+  let client: SoroStreamClient;
+  let mockAdapter: WalletAdapter;
+
+  beforeEach(() => {
+    mockAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(TEST_PK),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    client = new SoroStreamClient({
+      network: "testnet",
+      contractId: VALID_CONTRACT,
+      walletAdapter: mockAdapter,
+    });
+
+    vi.spyOn(client, "buildAndSubmit" as any).mockResolvedValue("txhash_op_cancel");
+  });
+
+  it("cancels stream as operator and returns tx hash", async () => {
+    const result = await client.operatorCancelStream({ streamId: "1" });
+    expect(result.txHash).toBe("txhash_op_cancel");
+  });
+});
+
+describe("SoroStreamClient operatorTopUp", () => {
+  let client: SoroStreamClient;
+  let mockAdapter: WalletAdapter;
+
+  beforeEach(() => {
+    mockAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(TEST_PK),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    client = new SoroStreamClient({
+      network: "testnet",
+      contractId: VALID_CONTRACT,
+      walletAdapter: mockAdapter,
+    });
+
+    vi.spyOn(client, "buildAndSubmit" as any).mockResolvedValue("txhash_op_topup");
+  });
+
+  it("tops up stream as operator and returns tx hash", async () => {
+    const result = await client.operatorTopUp({ streamId: "1", amount: 1000n });
+    expect(result.txHash).toBe("txhash_op_topup");
+  });
+
+  it("rejects zero amount", async () => {
+    await expect(
+      client.operatorTopUp({ streamId: "1", amount: 0n })
+    ).rejects.toThrow(InsufficientAmountError);
+  });
+});
+
 // ── updateFlowRate tests ─────────────────────────────────────────────────────
 
 describe("SoroStreamClient updateFlowRate", () => {

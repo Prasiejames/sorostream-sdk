@@ -58,6 +58,8 @@ export type {
   CancelStreamParams,
   TopUpParams,
   UpdateFlowRateParams,
+  SetOperatorParams,
+  OperatorTopUpParams,
   Network,
   WalletAdapter,
   FeeEstimate,

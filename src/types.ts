@@ -145,6 +145,19 @@ export interface UpdateFlowRateParams {
   newFlowRate: bigint;
 }
 
+/** Parameters for setting an operator on a stream. */
+export interface SetOperatorParams {
+  streamId: string;
+  operator: string;
+  approved: boolean;
+}
+
+/** Parameters for an operator to top up a stream. */
+export interface OperatorTopUpParams {
+  streamId: string;
+  amount: bigint;
+}
+
 /** A single milestone point in a vesting schedule. */
 export interface VestingSchedulePoint {
   /** Unix timestamp of the milestone. */

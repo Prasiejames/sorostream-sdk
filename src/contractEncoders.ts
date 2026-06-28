@@ -7,6 +7,9 @@ export interface ContractCallEncoder {
   cancelStream(streamId: string, sender: string): xdr.Operation;
   topUp(streamId: string, sender: string, amount: bigint): xdr.Operation;
   updateFlowRate(streamId: string, sender: string, newFlowRate: bigint): xdr.Operation;
+  setOperator(streamId: string, sender: string, operator: string, approved: boolean): xdr.Operation;
+  operatorCancelStream(streamId: string, operator: string): xdr.Operation;
+  operatorTopUp(streamId: string, operator: string, amount: bigint): xdr.Operation;
 }
 
 class V1Encoder implements ContractCallEncoder {
@@ -55,6 +58,33 @@ class V1Encoder implements ContractCallEncoder {
       nativeToScVal(BigInt(streamId), { type: "u64" }),
       nativeToScVal(sender, { type: "address" }),
       nativeToScVal(newFlowRate, { type: "i128" })
+    );
+  }
+
+  setOperator(streamId: string, sender: string, operator: string, approved: boolean): xdr.Operation {
+    return this.contract.call(
+      "set_operator",
+      nativeToScVal(BigInt(streamId), { type: "u64" }),
+      nativeToScVal(sender, { type: "address" }),
+      nativeToScVal(operator, { type: "address" }),
+      nativeToScVal(approved, { type: "bool" })
+    );
+  }
+
+  operatorCancelStream(streamId: string, operator: string): xdr.Operation {
+    return this.contract.call(
+      "operator_cancel_stream",
+      nativeToScVal(BigInt(streamId), { type: "u64" }),
+      nativeToScVal(operator, { type: "address" })
+    );
+  }
+
+  operatorTopUp(streamId: string, operator: string, amount: bigint): xdr.Operation {
+    return this.contract.call(
+      "operator_top_up",
+      nativeToScVal(BigInt(streamId), { type: "u64" }),
+      nativeToScVal(operator, { type: "address" }),
+      nativeToScVal(amount, { type: "i128" })
     );
   }
 }
