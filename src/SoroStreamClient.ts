@@ -41,6 +41,7 @@ import type {
   StreamEventFilter,
   StreamSubscription,
   TopUpParams,
+  UpdateFlowRateParams,
   WalletAdapter,
   WithdrawParams,
   WriteOptions,
@@ -516,6 +517,22 @@ export class SoroStreamClient {
     }
 
     return results;
+  }
+
+  /**
+   * Updates the flow rate on an active stream without cancelling it.
+   */
+  async updateFlowRate(
+    params: UpdateFlowRateParams,
+    signal?: AbortSignal,
+    options?: WriteOptions
+  ): Promise<{ txHash: string }> {
+    if (params.newFlowRate <= 0n) throw new InsufficientAmountError();
+    const sender = await this.walletAdapter.getPublicKey();
+    const operation = this.encoder.updateFlowRate(params.streamId, sender, params.newFlowRate);
+    const feeBump = this.resolveFeeBump(options?.feeBump);
+    const txHash = await this.buildAndSubmit(operation, signal, feeBump);
+    return { txHash };
   }
 
   // ── Fee estimation ────────────────────────────────────────────────────────

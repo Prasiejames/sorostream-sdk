@@ -1257,6 +1257,43 @@ describe("isStreamUnderfunded", () => {
   });
 });
 
+// ── updateFlowRate tests ─────────────────────────────────────────────────────
+
+describe("SoroStreamClient updateFlowRate", () => {
+  let client: SoroStreamClient;
+  let mockAdapter: WalletAdapter;
+
+  beforeEach(() => {
+    mockAdapter = {
+      getPublicKey: vi.fn().mockResolvedValue(TEST_PK),
+      signTransaction: vi.fn().mockResolvedValue("signed_xdr"),
+      isConnected: vi.fn().mockResolvedValue(true),
+    };
+
+    client = new SoroStreamClient({
+      network: "testnet",
+      contractId: VALID_CONTRACT,
+      walletAdapter: mockAdapter,
+    });
+
+    vi.spyOn(client, "buildAndSubmit" as any).mockResolvedValue("txhash_update");
+  });
+
+  it("updates flow rate and returns tx hash", async () => {
+    const result = await client.updateFlowRate({
+      streamId: "1",
+      newFlowRate: 200n,
+    });
+    expect(result.txHash).toBe("txhash_update");
+  });
+
+  it("rejects zero or negative flow rate", async () => {
+    await expect(
+      client.updateFlowRate({ streamId: "1", newFlowRate: 0n })
+    ).rejects.toThrow(InsufficientAmountError);
+  });
+});
+
 // ── Issue #48: withRetry ──────────────────────────────────────────────────────
 
 describe("withRetry", () => {

@@ -57,6 +57,7 @@ export type {
   WithdrawParams,
   CancelStreamParams,
   TopUpParams,
+  UpdateFlowRateParams,
   Network,
   WalletAdapter,
   FeeEstimate,

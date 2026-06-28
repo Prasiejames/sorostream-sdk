@@ -31,6 +31,7 @@ import type {
   StreamEventFilter,
   StreamSubscription,
   TopUpParams,
+  UpdateFlowRateParams,
   WithdrawParams,
 } from "./types.js";
 
@@ -233,6 +234,27 @@ export class MockSoroStreamClient {
     }
     results.push({ txHash: "mock-tx-batch-cancel", streamIds });
     return results;
+  }
+
+  async updateFlowRate(
+    params: UpdateFlowRateParams
+  ): Promise<{ txHash: string }> {
+    if (params.newFlowRate <= 0n) throw new Error("Flow rate must be > 0");
+    const stream = this.streams.get(params.streamId);
+    if (!stream) throw new Error(`Stream not found: ${params.streamId}`);
+    if (stream.status !== "Active") throw new Error("Stream is not active");
+
+    const streamedSoFar = stream.flowRate * BigInt(nowSec() - stream.startTime);
+    const remaining = stream.deposit - streamedSoFar;
+    const newEndTime = nowSec() + Number(remaining / params.newFlowRate);
+
+    this.streams.set(params.streamId, {
+      ...stream,
+      flowRate: params.newFlowRate,
+      endTime: newEndTime,
+    });
+
+    return { txHash: `mock-tx-update-fr-${params.streamId}` };
   }
 
   async getStream(streamId: string): Promise<Stream> {

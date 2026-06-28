@@ -6,6 +6,7 @@ export interface ContractCallEncoder {
   withdraw(streamId: string, recipient: string): xdr.Operation;
   cancelStream(streamId: string, sender: string): xdr.Operation;
   topUp(streamId: string, sender: string, amount: bigint): xdr.Operation;
+  updateFlowRate(streamId: string, sender: string, newFlowRate: bigint): xdr.Operation;
 }
 
 class V1Encoder implements ContractCallEncoder {
@@ -45,6 +46,15 @@ class V1Encoder implements ContractCallEncoder {
       nativeToScVal(BigInt(streamId), { type: "u64" }),
       nativeToScVal(sender, { type: "address" }),
       nativeToScVal(amount, { type: "i128" })
+    );
+  }
+
+  updateFlowRate(streamId: string, sender: string, newFlowRate: bigint): xdr.Operation {
+    return this.contract.call(
+      "update_flow_rate",
+      nativeToScVal(BigInt(streamId), { type: "u64" }),
+      nativeToScVal(sender, { type: "address" }),
+      nativeToScVal(newFlowRate, { type: "i128" })
     );
   }
 }

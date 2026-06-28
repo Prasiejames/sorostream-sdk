@@ -139,6 +139,12 @@ export interface BatchCancelResult {
   streamIds: string[];
 }
 
+/** Parameters for updating a stream's flow rate. */
+export interface UpdateFlowRateParams {
+  streamId: string;
+  newFlowRate: bigint;
+}
+
 /** A single milestone point in a vesting schedule. */
 export interface VestingSchedulePoint {
   /** Unix timestamp of the milestone. */
