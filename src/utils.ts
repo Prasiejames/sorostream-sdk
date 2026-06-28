@@ -377,6 +377,43 @@ export function watchStreamDrift(
   };
 }
 
+/**
+ * Checks whether an active stream is approaching its end time.
+ * @param stream - The stream object.
+ * @param thresholdSeconds - Seconds threshold (default 86400 = 24h).
+ */
+export function isStreamExpiring(stream: Stream, thresholdSeconds: number = 86400): boolean {
+  if (stream.status !== "Active") return false;
+  const remaining = timeUntilStreamEnd(stream);
+  return remaining > 0 && remaining < thresholdSeconds;
+}
+
+/**
+ * Checks whether an active stream has stalled (no recent withdrawals).
+ * @param stream - The stream object.
+ * @param staleThresholdSeconds - Seconds since last withdraw to consider stalled (default 604800 = 7d).
+ */
+export function isStreamStalled(stream: Stream, staleThresholdSeconds: number = 604800): boolean {
+  if (stream.status !== "Active") return false;
+  const now = Math.floor(Date.now() / 1000);
+  return now - stream.lastWithdrawTime > staleThresholdSeconds;
+}
+
+/**
+ * Checks whether a stream is under-funded — the remaining deposit is
+ * insufficient to sustain the flow rate until the current end time.
+ * This can happen when deposit rounding leaves a shortfall or when
+ * top-up amounts were too small to meaningfully extend the stream.
+ * @param stream - The stream object.
+ */
+export function isStreamUnderfunded(stream: Stream): boolean {
+  if (stream.status !== "Active" || stream.flowRate === 0n) return false;
+  const streamedSoFar = stream.flowRate * BigInt(stream.lastWithdrawTime - stream.startTime);
+  const remainingDeposit = stream.deposit - streamedSoFar;
+  const expectedRemaining = stream.flowRate * BigInt(stream.endTime - stream.lastWithdrawTime);
+  return remainingDeposit < expectedRemaining;
+}
+
 // ── Token aggregation ─────────────────────────────────────────────────────────
 
 

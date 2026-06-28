@@ -29,6 +29,9 @@ import {
   parseCsvStreamRows,
   detectStreamDrift,
   watchStreamDrift,
+  isStreamExpiring,
+  isStreamStalled,
+  isStreamUnderfunded,
 } from "../src/utils.js";
 import {
   InsufficientAmountError,
@@ -1166,6 +1169,91 @@ describe("watchStreamDrift", () => {
     expect(onDrift).not.toHaveBeenCalled();
 
     stop();
+  });
+});
+
+// ── Stream detection helpers ──────────────────────────────────────────────────
+
+describe("isStreamExpiring", () => {
+  it("returns false for non-active streams", () => {
+    expect(isStreamExpiring(makeStream({ status: "Cancelled" }))).toBe(false);
+    expect(isStreamExpiring(makeStream({ status: "Completed" }))).toBe(false);
+  });
+
+  it("returns true when stream ends within threshold", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const stream = makeStream({
+      status: "Active",
+      endTime: now + 100,
+    });
+    expect(isStreamExpiring(stream, 200)).toBe(true);
+  });
+
+  it("returns false when stream has plenty of time left", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const stream = makeStream({
+      status: "Active",
+      endTime: now + 100_000,
+    });
+    expect(isStreamExpiring(stream, 200)).toBe(false);
+  });
+});
+
+describe("isStreamStalled", () => {
+  it("returns false for non-active streams", () => {
+    expect(isStreamStalled(makeStream({ status: "Cancelled" }))).toBe(false);
+  });
+
+  it("returns true when last withdrawal was too long ago", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const stream = makeStream({
+      status: "Active",
+      lastWithdrawTime: now - 100_000,
+    });
+    expect(isStreamStalled(stream, 1000)).toBe(true);
+  });
+
+  it("returns false for recent withdrawals", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const stream = makeStream({
+      status: "Active",
+      lastWithdrawTime: now - 10,
+    });
+    expect(isStreamStalled(stream, 1000)).toBe(false);
+  });
+});
+
+describe("isStreamUnderfunded", () => {
+  it("returns false for non-active streams", () => {
+    expect(isStreamUnderfunded(makeStream({ status: "Cancelled" }))).toBe(false);
+  });
+
+  it("returns false for properly funded stream", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const start = now - 500;
+    const stream = makeStream({
+      status: "Active",
+      flowRate: 100n,
+      deposit: 100_000n,
+      startTime: start,
+      endTime: start + 1000,
+      lastWithdrawTime: start,
+    });
+    expect(isStreamUnderfunded(stream)).toBe(false);
+  });
+
+  it("returns true when deposit is too low for flow rate until end time", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const start = now - 100;
+    const stream = makeStream({
+      status: "Active",
+      flowRate: 100n,
+      deposit: 1000n,
+      startTime: start,
+      endTime: start + 1000,
+      lastWithdrawTime: start,
+    });
+    expect(isStreamUnderfunded(stream)).toBe(true);
   });
 });
 

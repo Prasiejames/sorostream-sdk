@@ -27,6 +27,9 @@ export {
   parseCsvStreamRows,
   detectStreamDrift,
   watchStreamDrift,
+  isStreamExpiring,
+  isStreamStalled,
+  isStreamUnderfunded,
 } from "./utils.js";
 export { templates } from "./templates.js";
 export { CircuitBreaker } from "./circuitBreaker.js";
