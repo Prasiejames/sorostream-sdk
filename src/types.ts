@@ -212,11 +212,13 @@ export interface BulkStreamRow {
   recipient: string;
   amount: bigint;
   durationSeconds: number;
+  /** Optional per-row token override. Falls back to BulkCreateOptions.token when omitted. */
+  token?: string;
 }
 
 /** Options for bulkCreateStreams. */
 export interface BulkCreateOptions {
-  /** SAC token contract address applied to every row. */
+  /** SAC token contract address. Applied as default when a row omits `token`. */
   token: string;
   /** Whether auto-renew is enabled (default false). */
   autoRenew?: boolean;

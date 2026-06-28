@@ -931,7 +931,7 @@ export class SoroStreamClient {
     options: BulkCreateOptions
   ): Promise<BulkCreateResult> {
     const sender = await this.walletAdapter.getPublicKey();
-    const token = options.token;
+    const defaultToken = options.token;
     const autoRenew = options.autoRenew ?? false;
     const batchSize = options.batchSize ?? 8;
 
@@ -939,24 +939,52 @@ export class SoroStreamClient {
 
     for (let i = 0; i < rows.length; i += batchSize) {
       const chunk = rows.slice(i, i + batchSize);
-      const operations = chunk.map((row) =>
-        this.encoder.createStream(sender, {
-          recipient: row.recipient,
-          token,
-          amount: row.amount,
-          durationSeconds: row.durationSeconds,
-          autoRenew,
-        })
+      const chunkHasMixedTokens = chunk.some(
+        (r) => r.token != null && r.token !== defaultToken
       );
 
-      const txHash = await this.executeBatch(operations);
+      if (chunkHasMixedTokens) {
+        // When rows have different tokens, submit each as a separate transaction
+        for (const row of chunk) {
+          const rowToken = row.token ?? defaultToken;
+          const operation = this.encoder.createStream(sender, {
+            recipient: row.recipient,
+            token: rowToken,
+            amount: row.amount,
+            durationSeconds: row.durationSeconds,
+            autoRenew,
+          });
+          const txHash = await this.buildAndSubmit(operation);
 
-      const result = await this.getStreamsBySender(sender);
-      const streams = Array.isArray(result) ? result : result.streams;
-      const newStreams = streams.slice(-chunk.length);
-      const streamIds = newStreams.map((s) => s.id);
+          const result = await this.getStreamsBySender(sender);
+          const streams = Array.isArray(result) ? result : result.streams;
+          const newStreams = streams.slice(-1);
+          const streamIds = newStreams.map((s) => s.id);
 
-      results.push({ txHash, streamIds, rows: chunk });
+          results.push({ txHash, streamIds, rows: [row] });
+        }
+      } else {
+        // All rows in this chunk use the same token — batch into one transaction
+        const operations = chunk.map((row) => {
+          const rowToken = row.token ?? defaultToken;
+          return this.encoder.createStream(sender, {
+            recipient: row.recipient,
+            token: rowToken,
+            amount: row.amount,
+            durationSeconds: row.durationSeconds,
+            autoRenew,
+          });
+        });
+
+        const txHash = await this.executeBatch(operations);
+
+        const result = await this.getStreamsBySender(sender);
+        const streams = Array.isArray(result) ? result : result.streams;
+        const newStreams = streams.slice(-chunk.length);
+        const streamIds = newStreams.map((s) => s.id);
+
+        results.push({ txHash, streamIds, rows: chunk });
+      }
     }
 
     return { batches: results };

@@ -577,6 +577,7 @@ export function parseCsvStreamRows(csv: string): BulkStreamRow[] {
   const recipientIdx = cols.indexOf("recipient");
   const amountIdx = cols.indexOf("amount");
   const durationIdx = cols.indexOf("durationseconds");
+  const tokenIdx = cols.indexOf("token");
 
   if (recipientIdx === -1) throw new Error("CSV missing 'recipient' column");
   if (amountIdx === -1) throw new Error("CSV missing 'amount' column");
@@ -600,7 +601,12 @@ export function parseCsvStreamRows(csv: string): BulkStreamRow[] {
       throw new Error(`Row ${i + 1}: invalid durationSeconds`);
     }
 
-    rows.push({ recipient, amount, durationSeconds });
+    const row: BulkStreamRow = { recipient, amount, durationSeconds };
+    if (tokenIdx !== -1 && fields[tokenIdx]) {
+      row.token = fields[tokenIdx];
+    }
+
+    rows.push(row);
   }
 
   return rows;
